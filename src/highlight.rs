@@ -20,7 +20,10 @@ pub struct Highlighter {
 
 impl Highlighter {
     pub fn new() -> Self {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
+        // bat's extended syntax set (via two-face): covers TypeScript, TSX,
+        // TOML, Vue, Svelte, Dockerfile and much more that syntect's bundled
+        // Sublime defaults lack.
+        let syntax_set = two_face::syntax::extra_newlines();
         let theme_set = ThemeSet::load_defaults();
         let theme = theme_set
             .themes
@@ -53,9 +56,14 @@ impl Highlighter {
             return Vec::new();
         }
 
+        let ext = extension(path);
         let syntax = self
             .syntax_set
-            .find_syntax_by_extension(extension(path))
+            .find_syntax_by_extension(ext)
+            .or_else(|| {
+                extension_alias(ext)
+                    .and_then(|alias| self.syntax_set.find_syntax_by_extension(alias))
+            })
             .or_else(|| {
                 text.lines()
                     .next()
@@ -89,6 +97,15 @@ impl Highlighter {
     }
 }
 
+/// Fallback mapping for extensions the syntax set doesn't know directly.
+fn extension_alias(ext: &str) -> Option<&'static str> {
+    match ext {
+        "jsx" | "mjs" | "cjs" => Some("js"),
+        "mts" | "cts" => Some("ts"),
+        _ => None,
+    }
+}
+
 fn extension(path: &str) -> &str {
     std::path::Path::new(path)
         .extension()
@@ -106,4 +123,43 @@ fn to_ratatui_style(style: syntect::highlighting::Style) -> Style {
         out = out.add_modifier(Modifier::ITALIC);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn distinct_colors(h: &Highlighter, path: &str, text: &str) -> usize {
+        let segs = h.highlight(path, text);
+        let mut colors = std::collections::HashSet::new();
+        for line in &segs {
+            for (s, _) in line {
+                colors.insert(format!("{:?}", s.fg));
+            }
+        }
+        colors.len()
+    }
+
+    /// Real tokenization produces multiple foreground colors; a language
+    /// falling back to plain text produces exactly one (the theme default).
+    #[test]
+    fn common_languages_are_tokenized() {
+        let h = Highlighter::new();
+        let cases = [
+            ("f.rs", "fn f() -> u8 { return 1; } // c\n"),
+            ("f.ts", "const f = (x: number): string => `v${x}`; // c\n"),
+            ("f.tsx", "const A = () => <div className=\"x\">{y}</div>;\n"),
+            ("f.jsx", "const A = () => <div className=\"x\">{y}</div>;\n"),
+            ("f.py", "def g(x): return None  # c\n"),
+            ("f.go", "func f() int { return 1 } // c\n"),
+            ("f.toml", "[table]\nkey = \"value\"\n"),
+            ("f.vue", "<template><div :class=\"x\">{{ y }}</div></template>\n"),
+        ];
+        for (path, text) in cases {
+            assert!(
+                distinct_colors(&h, path, text) > 1,
+                "{path} was not tokenized (single color)"
+            );
+        }
+    }
 }

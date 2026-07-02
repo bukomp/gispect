@@ -337,6 +337,7 @@ dependencies = [
  "serde_json",
  "similar",
  "syntect",
+ "two-face",
 ]
 
 [[package]]
@@ -877,6 +878,17 @@ checksum = "c431b87111666e491a90baa837f914fb45cd5dc3c268591b0220ff5057f2085f"
 dependencies = [
  "num-conv",
  "time-core",
+]
+
+[[package]]
+name = "two-face"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b285c51f8a6ade109ed4566d33ac4fb289fb5d6cf87ed70908a5eaf65e948e34"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "syntect",
 ]
 
 [[package]]
