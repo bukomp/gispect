@@ -44,6 +44,7 @@ Cycle with `m`:
 |---|---|
 | `j` / `k`, `↓` / `↑` | select file |
 | `J` / `K`, `PgDn` / `PgUp`, `Ctrl-d` / `Ctrl-u` | scroll diff |
+| `n` / `N` | jump to next / previous change |
 | `g` / `G` | top / bottom of diff |
 | `h` / `l`, `←` / `→` | horizontal scroll |
 | `m` | cycle diff mode |

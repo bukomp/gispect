@@ -1,7 +1,9 @@
 //! Terminal application state and event loop.
 
+use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -17,12 +19,38 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::git::GitRepo;
-use crate::types::{DiffMode, FileEntry, FileStatus, SideBySideDiff};
+use crate::highlight::{self, HlLines};
+use crate::types::{DiffMode, FileEntry, FileStatus, RowKind, SideBySideDiff};
 use crate::{diff, update};
 
 /// How long a footer notification stays visible before the shortcut
 /// hints come back.
 const STATUS_TTL: Duration = Duration::from_secs(2);
+
+/// How often the background watcher re-fingerprints the repository to
+/// pick up external changes (edits, commits, staging).
+const WATCH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Highlight cache entries beyond this count are dropped wholesale;
+/// keeps memory bounded without LRU bookkeeping.
+const HL_CACHE_MAX: usize = 256;
+
+/// One side of a file handed to the highlight worker thread.
+struct HlJob {
+    generation: u64,
+    is_left: bool,
+    key: u64,
+    path: String,
+    content: String,
+}
+
+/// A finished highlight, sent back from the worker to the UI thread.
+struct HlUpdate {
+    generation: u64,
+    is_left: bool,
+    key: u64,
+    lines: Arc<HlLines>,
+}
 
 /// Outcome of the background update check, shared with the checker thread.
 #[derive(Debug, Clone)]
@@ -60,10 +88,21 @@ pub struct App {
     /// Whether syntax highlighting is enabled for the diff panes.
     pub(crate) syntax: bool,
     /// Highlighted segments for the left (old) pane, indexed by line - 1.
-    pub(crate) left_hl: Vec<Vec<(ratatui::style::Style, String)>>,
+    pub(crate) left_hl: Arc<HlLines>,
     /// Highlighted segments for the right (new) pane, indexed by line - 1.
-    pub(crate) right_hl: Vec<Vec<(ratatui::style::Style, String)>>,
-    highlighter: crate::highlight::Highlighter,
+    pub(crate) right_hl: Arc<HlLines>,
+    /// Jobs to the background highlight worker.
+    hl_jobs: mpsc::Sender<HlJob>,
+    /// Finished highlights back from the worker.
+    hl_results: mpsc::Receiver<HlUpdate>,
+    /// Finished highlights keyed by (path, content) hash, so revisiting a
+    /// file (or toggling syntax) is instant.
+    hl_cache: HashMap<u64, Arc<HlLines>>,
+    /// Bumped on every diff reload; stale worker results (from a file the
+    /// user already navigated away from) are cached but not displayed.
+    hl_generation: u64,
+    /// Set by the repo watcher thread when the repository changed on disk.
+    repo_changed: Arc<AtomicBool>,
     trigger_update: bool,
     awaiting_update_exit: bool,
 }
@@ -76,6 +115,9 @@ impl App {
         };
         let branch = repo.current_branch();
         let base_choices = repo.local_branches().unwrap_or_default();
+        let (hl_jobs, hl_results) = spawn_highlight_worker();
+        let repo_changed = Arc::new(AtomicBool::new(false));
+        spawn_repo_watcher(repo.clone(), repo_changed.clone());
         App {
             repo,
             mode,
@@ -95,9 +137,13 @@ impl App {
             quit: false,
             last_viewport_height: 20,
             syntax: true,
-            left_hl: Vec::new(),
-            right_hl: Vec::new(),
-            highlighter: crate::highlight::Highlighter::new(),
+            left_hl: Arc::new(Vec::new()),
+            right_hl: Arc::new(Vec::new()),
+            hl_jobs,
+            hl_results,
+            hl_cache: HashMap::new(),
+            hl_generation: 0,
+            repo_changed,
             trigger_update: false,
             awaiting_update_exit: false,
         }
@@ -142,12 +188,16 @@ impl App {
     }
 
     /// Recompute the side-by-side diff for the currently selected file.
+    /// Highlighting is served from cache when possible, otherwise handed
+    /// to the background worker — the unstyled diff renders immediately
+    /// and styled lines swap in when the worker finishes.
     fn reload_diff(&mut self) {
         self.diff = SideBySideDiff::default();
         self.scroll = 0;
         self.h_scroll = 0;
-        self.left_hl = Vec::new();
-        self.right_hl = Vec::new();
+        self.hl_generation += 1;
+        self.left_hl = Arc::new(Vec::new());
+        self.right_hl = Arc::new(Vec::new());
         let Some(entry) = self.files.get(self.selected).cloned() else {
             return;
         };
@@ -163,14 +213,80 @@ impl App {
                         FileStatus::Renamed { from } => from.clone(),
                         _ => entry.path.clone(),
                     };
-                    self.left_hl = self.highlighter.highlight(&old_path, &old);
-                    self.right_hl = self.highlighter.highlight(&entry.path, &new);
+                    self.request_highlight(true, old_path, old);
+                    self.request_highlight(false, entry.path.clone(), new);
                 }
             }
             Err(e) => {
                 self.set_status(format!("error: {e}"));
             }
         }
+    }
+
+    /// Apply a cached highlight for one pane, or queue it on the worker.
+    fn request_highlight(&mut self, is_left: bool, path: String, content: String) {
+        let key = highlight::cache_key(&path, &content);
+        if let Some(lines) = self.hl_cache.get(&key) {
+            if is_left {
+                self.left_hl = lines.clone();
+            } else {
+                self.right_hl = lines.clone();
+            }
+            return;
+        }
+        let _ = self.hl_jobs.send(HlJob {
+            generation: self.hl_generation,
+            is_left,
+            key,
+            path,
+            content,
+        });
+    }
+
+    /// Drain finished highlights from the worker: cache every result, and
+    /// display those still matching the current file.
+    pub(crate) fn apply_highlight_results(&mut self) {
+        while let Ok(update) = self.hl_results.try_recv() {
+            if self.hl_cache.len() >= HL_CACHE_MAX {
+                self.hl_cache.clear();
+            }
+            self.hl_cache.insert(update.key, update.lines.clone());
+            if update.generation == self.hl_generation && self.syntax {
+                if update.is_left {
+                    self.left_hl = update.lines;
+                } else {
+                    self.right_hl = update.lines;
+                }
+            }
+        }
+    }
+
+    /// If the watcher flagged a repository change, reload while keeping
+    /// the selected file (matched by path) and scroll position.
+    pub(crate) fn poll_auto_refresh(&mut self) {
+        if !self.repo_changed.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let selected_path = self.files.get(self.selected).map(|e| e.path.clone());
+        let scroll = self.scroll;
+        let h_scroll = self.h_scroll;
+        match self.repo.changed_files(&self.mode) {
+            Ok(files) => self.files = files,
+            // Transient failure (e.g. mid-rebase): keep the current view.
+            Err(_) => return,
+        }
+        if let Some(path) = selected_path {
+            if let Some(idx) = self.files.iter().position(|e| e.path == path) {
+                self.selected = idx;
+            }
+        }
+        if self.selected >= self.files.len() {
+            self.selected = self.files.len().saturating_sub(1);
+        }
+        self.reload_diff();
+        self.scroll = scroll;
+        self.h_scroll = h_scroll;
+        self.clamp_scroll();
     }
 
     /// Number of scrollable rows in the diff view: aligned rows normally,
@@ -189,6 +305,64 @@ impl App {
         let max = self.row_count().saturating_sub(1);
         if self.scroll > max {
             self.scroll = max;
+        }
+    }
+
+    /// Start indices (in aligned row space) of each contiguous run of
+    /// changed rows — the "hunks" that n/N jump between.
+    fn hunk_starts(&self) -> Vec<usize> {
+        let mut starts = Vec::new();
+        let mut in_hunk = false;
+        for (i, row) in self.diff.rows.iter().enumerate() {
+            let changed = row.kind != RowKind::Context;
+            if changed && !in_hunk {
+                starts.push(i);
+            }
+            in_hunk = changed;
+        }
+        starts
+    }
+
+    /// Convert an aligned row index into a scroll position for the current
+    /// view. In compact mode each pane renders its own filtered row list at
+    /// the shared scroll offset, so take the earlier of the two per-pane
+    /// positions — that way neither pane has scrolled past the change.
+    fn row_to_scroll(&self, idx: usize) -> usize {
+        if !self.compact {
+            return idx;
+        }
+        let left = self.diff.rows[..idx].iter().filter(|r| r.left.is_some()).count();
+        let right = self.diff.rows[..idx].iter().filter(|r| r.right.is_some()).count();
+        left.min(right)
+    }
+
+    /// Jump to the next (`forward`) or previous change hunk relative to the
+    /// current scroll position.
+    fn jump_change(&mut self, forward: bool) {
+        let starts = self.hunk_starts();
+        if starts.is_empty() {
+            self.set_status("no changes in this file".to_string());
+            return;
+        }
+        let positions: Vec<usize> = starts.iter().map(|&i| self.row_to_scroll(i)).collect();
+        let target = if forward {
+            positions.iter().position(|&p| p > self.scroll)
+        } else {
+            positions.iter().rposition(|&p| p < self.scroll)
+        };
+        match target {
+            Some(i) => {
+                self.scroll = positions[i];
+                self.clamp_scroll();
+                self.set_status(format!("change {}/{}", i + 1, positions.len()));
+            }
+            None => {
+                self.set_status(if forward {
+                    "no more changes below".to_string()
+                } else {
+                    "no more changes above".to_string()
+                });
+            }
         }
     }
 
@@ -274,6 +448,8 @@ impl App {
                 let half = (self.last_viewport_height / 2).max(1);
                 self.scroll = self.scroll.saturating_sub(half);
             }
+            KeyCode::Char('n') => self.jump_change(true),
+            KeyCode::Char('N') => self.jump_change(false),
             KeyCode::Char('g') => self.scroll = 0,
             KeyCode::Char('G') => {
                 self.scroll = self.row_count().saturating_sub(1);
@@ -392,6 +568,55 @@ pub fn run(repo: GitRepo, mode: DiffMode) -> Result<()> {
     result
 }
 
+/// Spawn the highlight worker thread. It owns the (slow-to-load) syntect
+/// syntax set, so startup and the UI thread never block on it. Queued
+/// jobs are drained latest-generation-first, so holding j/k doesn't pile
+/// up highlight work for files the user has already skipped past.
+fn spawn_highlight_worker() -> (mpsc::Sender<HlJob>, mpsc::Receiver<HlUpdate>) {
+    let (job_tx, job_rx) = mpsc::channel::<HlJob>();
+    let (res_tx, res_rx) = mpsc::channel::<HlUpdate>();
+    std::thread::spawn(move || {
+        let highlighter = highlight::Highlighter::new();
+        while let Ok(first) = job_rx.recv() {
+            let mut batch = vec![first];
+            while let Ok(job) = job_rx.try_recv() {
+                batch.push(job);
+            }
+            let newest = batch.iter().map(|j| j.generation).max().unwrap_or(0);
+            for job in batch.into_iter().filter(|j| j.generation == newest) {
+                let lines = Arc::new(highlighter.highlight(&job.path, &job.content));
+                let update = HlUpdate {
+                    generation: job.generation,
+                    is_left: job.is_left,
+                    key: job.key,
+                    lines,
+                };
+                if res_tx.send(update).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    (job_tx, res_rx)
+}
+
+/// Poll the repository fingerprint on a background thread and raise
+/// `flag` whenever it changes, so the UI auto-refreshes on external
+/// edits, commits, or staging. Exits with the process.
+fn spawn_repo_watcher(repo: GitRepo, flag: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let mut last = repo.state_fingerprint();
+        loop {
+            std::thread::sleep(WATCH_INTERVAL);
+            let current = repo.state_fingerprint();
+            if current != last {
+                last = current;
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
 /// Run `update::check_for_update` on a background thread, storing the
 /// outcome (including failures) in the shared state slot.
 fn spawn_update_check(slot: Arc<Mutex<UpdateState>>) {
@@ -418,6 +643,8 @@ fn event_loop(
         })?;
 
         app.expire_status();
+        app.apply_highlight_results();
+        app.poll_auto_refresh();
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {

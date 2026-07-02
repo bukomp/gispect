@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use crate::types::{DiffMode, FileEntry, FileStatus};
 
 /// A discovered git repository rooted at a working-tree top-level.
+#[derive(Clone)]
 pub struct GitRepo {
     root: PathBuf,
 }
@@ -289,6 +290,19 @@ impl GitRepo {
             DiffMode::Staged => self.show(":0", path).or_else(|| self.show(":", path)),
             DiffMode::Unstaged => std::fs::read_to_string(self.root.join(path)).ok(),
         }
+    }
+
+    /// Fingerprint of all repository state any diff mode can show: HEAD
+    /// commit, index/working-tree status, and uncommitted content (`git
+    /// diff HEAD` catches re-edits to files that were already modified,
+    /// which `status --porcelain` alone would not).
+    pub fn state_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.git_opt(&["rev-parse", "HEAD"]).hash(&mut hasher);
+        self.git_opt(&["status", "--porcelain"]).hash(&mut hasher);
+        self.git_opt(&["diff", "HEAD"]).hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Plain unified `git diff` text for `mode`, optionally limited to one

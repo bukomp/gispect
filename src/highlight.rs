@@ -7,6 +7,20 @@ use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+/// Highlighted segments for a whole file: one entry per line (index 0 =
+/// line 1), each entry the line's styled segments.
+pub type HlLines = Vec<Vec<(Style, String)>>;
+
+/// Cache key for a highlight result: the path (drives syntax selection)
+/// plus the exact content.
+pub fn cache_key(path: &str, text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Maximum input size we'll attempt to highlight, to keep the UI responsive.
 const MAX_BYTES: usize = 1024 * 1024;
 /// Maximum number of lines we'll attempt to highlight.
@@ -47,7 +61,7 @@ impl Highlighter {
     /// Returns an empty Vec if `text` is too large to highlight quickly, or
     /// for any line whose highlighting fails, falls back to a single
     /// unstyled segment for just that line.
-    pub fn highlight(&self, path: &str, text: &str) -> Vec<Vec<(Style, String)>> {
+    pub fn highlight(&self, path: &str, text: &str) -> HlLines {
         if text.len() > MAX_BYTES {
             return Vec::new();
         }

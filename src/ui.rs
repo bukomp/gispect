@@ -66,7 +66,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  m mode  c compact  s syntax  f files  b base  r reload  U update  ? help  q quit",
+            " j/k files  J/K scroll  n/N change  m mode  c compact  s syntax  f files  b base  r reload  U update  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
@@ -335,7 +335,7 @@ fn center_vertically(area: Rect, content_height: u16) -> Rect {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let width = 50u16.min(area.width);
-    let height = 18u16.min(area.height);
+    let height = 19u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect { x, y, width, height };
@@ -350,6 +350,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("J / K        scroll diff down / up"),
         Line::from("Ctrl-d/u     half-page scroll"),
         Line::from("PgDn / PgUp  half-page scroll"),
+        Line::from("n / N        next / previous change"),
         Line::from("g / G        top / bottom of diff"),
         Line::from("h/l ← →      scroll horizontally"),
         Line::from("mouse wheel  scroll diff (shift: horizontal)"),
