@@ -31,6 +31,10 @@ const STATUS_TTL: Duration = Duration::from_secs(2);
 /// pick up external changes (edits, commits, staging).
 const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Context rows kept above a change hunk when jumping with n/N, so the
+/// target doesn't sit flush against the top of the viewport.
+const JUMP_PADDING: usize = 5;
+
 /// Highlight cache entries beyond this count are dropped wholesale;
 /// keeps memory bounded without LRU bookkeeping.
 const HL_CACHE_MAX: usize = 256;
@@ -345,14 +349,17 @@ impl App {
             return;
         }
         let positions: Vec<usize> = starts.iter().map(|&i| self.row_to_scroll(i)).collect();
+        // The hunk currently "at" the viewport sits JUMP_PADDING rows below
+        // the top, so compare against that anchor rather than raw scroll.
+        let anchor = self.scroll + JUMP_PADDING;
         let target = if forward {
-            positions.iter().position(|&p| p > self.scroll)
+            positions.iter().position(|&p| p > anchor)
         } else {
-            positions.iter().rposition(|&p| p < self.scroll)
+            positions.iter().rposition(|&p| p < anchor)
         };
         match target {
             Some(i) => {
-                self.scroll = positions[i];
+                self.scroll = positions[i].saturating_sub(JUMP_PADDING);
                 self.clamp_scroll();
                 self.set_status(format!("change {}/{}", i + 1, positions.len()));
             }
