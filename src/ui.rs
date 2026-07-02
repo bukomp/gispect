@@ -60,7 +60,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  m mode  c compact  b base  r reload  U update  ? help  q quit",
+            " j/k files  J/K scroll  m mode  c compact  s syntax  f files  b base  r reload  U update  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
@@ -68,20 +68,21 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_body(f: &mut Frame, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(34),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
-    draw_file_list(f, app, chunks[0]);
+    let diff_area = if app.show_files {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(34), Constraint::Min(0)])
+            .split(area);
+        draw_file_list(f, app, chunks[0]);
+        chunks[1]
+    } else {
+        area
+    };
 
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
+        .split(diff_area);
 
     draw_diff_pane(f, app, panes[0], true);
     draw_diff_pane(f, app, panes[1], false);
@@ -152,7 +153,14 @@ fn window_offset(selected: usize, total: usize, height: usize) -> usize {
 }
 
 fn draw_diff_pane(f: &mut Frame, app: &App, area: Rect, is_left: bool) {
-    let title = if is_left { "Old" } else { "New" };
+    // With the file list hidden, show the selected path in the pane title
+    // so the user keeps their bearings.
+    let title = match (is_left, app.show_files, app.files.get(app.selected)) {
+        (true, false, Some(e)) => format!("Old — {}", e.path),
+        (false, false, Some(e)) => format!("New — {}", e.path),
+        (true, ..) => "Old".to_string(),
+        (false, ..) => "New".to_string(),
+    };
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -188,47 +196,122 @@ fn draw_diff_pane(f: &mut Frame, app: &App, area: Rect, is_left: bool) {
     for row in &rows[start..end] {
         let cell = if is_left { &row.left } else { &row.right };
 
-        let (line_no_str, content) = match cell {
-            Some(c) => (format!("{:>4} ", c.line_no), c.content.clone()),
-            None => ("     ".to_string(), String::new()),
-        };
+        let (line_no_str, segments): (String, Vec<(Style, String)>) = match cell {
+            Some(c) => {
+                let line_no_str = format!("{:>4} ", c.line_no);
 
-        let style = if cell.is_none() {
-            Style::default().add_modifier(Modifier::DIM)
-        } else {
-            match row.kind {
-                RowKind::Context => Style::default(),
-                RowKind::Removed => {
-                    if is_left {
-                        Style::default().fg(Color::Red)
+                // Base segments: syntax-highlighted spans when enabled and
+                // available, otherwise a single unstyled segment.
+                let base_segments: Vec<(Style, String)> = if app.syntax {
+                    let hl = if is_left { &app.left_hl } else { &app.right_hl };
+                    hl.get(c.line_no - 1)
+                        .cloned()
+                        .unwrap_or_else(|| vec![(Style::default(), c.content.clone())])
+                } else {
+                    vec![(Style::default(), c.content.clone())]
+                };
+
+                // Expand tabs within each segment.
+                let base_segments: Vec<(Style, String)> = base_segments
+                    .into_iter()
+                    .map(|(s, text)| (s, text.replace('\t', "    ")))
+                    .collect();
+
+                let segments = if app.syntax {
+                    // Keep syntax foregrounds; mark diff roles with a
+                    // background tint instead of overriding the foreground.
+                    let bg = match (row.kind, is_left) {
+                        (RowKind::Removed, true) => Some(Color::Rgb(80, 30, 30)),
+                        (RowKind::Modified, true) => Some(Color::Rgb(80, 30, 30)),
+                        (RowKind::Added, false) => Some(Color::Rgb(25, 70, 35)),
+                        (RowKind::Modified, false) => Some(Color::Rgb(25, 70, 35)),
+                        _ => None,
+                    };
+                    if let Some(bg) = bg {
+                        base_segments
+                            .into_iter()
+                            .map(|(s, text)| (s.patch(Style::default().bg(bg)), text))
+                            .collect()
                     } else {
-                        Style::default().add_modifier(Modifier::DIM)
+                        base_segments
                     }
-                }
-                RowKind::Added => {
-                    if is_left {
-                        Style::default().add_modifier(Modifier::DIM)
-                    } else {
-                        Style::default().fg(Color::Green)
-                    }
-                }
-                RowKind::Modified => Style::default().fg(Color::Yellow),
+                } else {
+                    // Syntax highlighting off: preserve the original
+                    // foreground-color-only role styling.
+                    let style = match row.kind {
+                        RowKind::Context => Style::default(),
+                        RowKind::Removed => {
+                            if is_left {
+                                Style::default().fg(Color::Red)
+                            } else {
+                                Style::default().add_modifier(Modifier::DIM)
+                            }
+                        }
+                        RowKind::Added => {
+                            if is_left {
+                                Style::default().add_modifier(Modifier::DIM)
+                            } else {
+                                Style::default().fg(Color::Green)
+                            }
+                        }
+                        RowKind::Modified => Style::default().fg(Color::Yellow),
+                    };
+                    vec![(style, base_segments.into_iter().map(|(_, t)| t).collect())]
+                };
+
+                (line_no_str, segments)
             }
+            None => (
+                "     ".to_string(),
+                vec![(Style::default().add_modifier(Modifier::DIM), String::new())],
+            ),
         };
 
-        let expanded = content.replace('\t', "    ");
-        let sliced: String = expanded.chars().skip(app.h_scroll).collect();
         let content_width = width.saturating_sub(line_no_str.len());
-        let truncated: String = sliced.chars().take(content_width).collect();
+        let sliced = slice_segments(&segments, app.h_scroll, content_width);
 
-        let line = Line::from(vec![
-            Span::styled(line_no_str, Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(truncated, style),
-        ]);
-        lines.push(line);
+        let mut spans = vec![Span::styled(
+            line_no_str,
+            Style::default().add_modifier(Modifier::DIM),
+        )];
+        spans.extend(sliced.into_iter().map(|(style, text)| Span::styled(text, style)));
+
+        lines.push(Line::from(spans));
     }
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Skip `skip` characters and keep at most `take` characters across a
+/// sequence of styled segments, preserving per-segment styles and staying
+/// char-boundary-safe.
+fn slice_segments(segments: &[(Style, String)], skip: usize, take: usize) -> Vec<(Style, String)> {
+    let mut skip_remaining = skip;
+    let mut take_remaining = take;
+    let mut result = Vec::new();
+
+    for (style, text) in segments {
+        if take_remaining == 0 {
+            break;
+        }
+        let char_count = text.chars().count();
+        if skip_remaining >= char_count {
+            skip_remaining -= char_count;
+            continue;
+        }
+        let piece: String = text
+            .chars()
+            .skip(skip_remaining)
+            .take(take_remaining)
+            .collect();
+        skip_remaining = 0;
+        if !piece.is_empty() {
+            take_remaining -= piece.chars().count();
+            result.push((*style, piece));
+        }
+    }
+
+    result
 }
 
 fn center_vertically(area: Rect, content_height: u16) -> Rect {
@@ -246,7 +329,7 @@ fn center_vertically(area: Rect, content_height: u16) -> Rect {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let width = 50u16.min(area.width);
-    let height = 15u16.min(area.height);
+    let height = 17u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect { x, y, width, height };
@@ -265,6 +348,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("h/l ← →      scroll horizontally"),
         Line::from("m            cycle diff mode"),
         Line::from("c            toggle compact view (hide filler)"),
+        Line::from("s            toggle syntax highlighting"),
+        Line::from("f            toggle file list panel"),
         Line::from("b            cycle base branch"),
         Line::from("r            reload"),
         Line::from("U            apply update"),

@@ -48,6 +48,7 @@ Cycle with `m`:
 | `h` / `l`, `←` / `→` | horizontal scroll |
 | `m` | cycle diff mode |
 | `c` | toggle compact view — hide alignment filler rows so each pane reads contiguously |
+| `s` | toggle syntax highlighting |
 | `b` | cycle base branch |
 | `r` | reload |
 | `U` | apply available update |

@@ -16,7 +16,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::git::GitRepo;
-use crate::types::{DiffMode, FileEntry, SideBySideDiff};
+use crate::types::{DiffMode, FileEntry, FileStatus, SideBySideDiff};
 use crate::{diff, update};
 
 /// All state needed to render and drive the TUI.
@@ -34,11 +34,20 @@ pub struct App {
     /// Compact view: hide alignment filler rows so each pane shows its
     /// version of the file contiguously.
     pub(crate) compact: bool,
+    /// Whether the changed-files panel is visible.
+    pub(crate) show_files: bool,
     pub(crate) status: Option<String>,
     pub(crate) update_available: Arc<Mutex<Option<String>>>,
     pub(crate) base_choices: Vec<String>,
     pub(crate) quit: bool,
     pub(crate) last_viewport_height: usize,
+    /// Whether syntax highlighting is enabled for the diff panes.
+    pub(crate) syntax: bool,
+    /// Highlighted segments for the left (old) pane, indexed by line - 1.
+    pub(crate) left_hl: Vec<Vec<(ratatui::style::Style, String)>>,
+    /// Highlighted segments for the right (new) pane, indexed by line - 1.
+    pub(crate) right_hl: Vec<Vec<(ratatui::style::Style, String)>>,
+    highlighter: crate::highlight::Highlighter,
     trigger_update: bool,
     awaiting_update_exit: bool,
 }
@@ -63,11 +72,16 @@ impl App {
             h_scroll: 0,
             show_help: false,
             compact: false,
+            show_files: true,
             status: None,
             update_available: Arc::new(Mutex::new(None)),
             base_choices,
             quit: false,
             last_viewport_height: 20,
+            syntax: true,
+            left_hl: Vec::new(),
+            right_hl: Vec::new(),
+            highlighter: crate::highlight::Highlighter::new(),
             trigger_update: false,
             awaiting_update_exit: false,
         }
@@ -101,6 +115,8 @@ impl App {
         self.diff = SideBySideDiff::default();
         self.scroll = 0;
         self.h_scroll = 0;
+        self.left_hl = Vec::new();
+        self.right_hl = Vec::new();
         let Some(entry) = self.files.get(self.selected).cloned() else {
             return;
         };
@@ -111,6 +127,14 @@ impl App {
         match self.repo.file_versions(&self.mode, &entry) {
             Ok((old, new)) => {
                 self.diff = diff::side_by_side(&old, &new);
+                if self.syntax {
+                    let old_path = match &entry.status {
+                        FileStatus::Renamed { from } => from.clone(),
+                        _ => entry.path.clone(),
+                    };
+                    self.left_hl = self.highlighter.highlight(&old_path, &old);
+                    self.right_hl = self.highlighter.highlight(&entry.path, &new);
+                }
             }
             Err(e) => {
                 self.status = Some(format!("error: {e}"));
@@ -235,6 +259,9 @@ impl App {
                 self.reload();
                 self.status = Some(label);
             }
+            KeyCode::Char('f') => {
+                self.show_files = !self.show_files;
+            }
             KeyCode::Char('c') => {
                 self.compact = !self.compact;
                 self.clamp_scroll();
@@ -242,6 +269,20 @@ impl App {
                     "compact view: filler rows hidden (panes scroll independently)".to_string()
                 } else {
                     "aligned view: filler rows shown".to_string()
+                });
+            }
+            KeyCode::Char('s') => {
+                self.syntax = !self.syntax;
+                let scroll = self.scroll;
+                let h_scroll = self.h_scroll;
+                self.reload_diff();
+                self.scroll = scroll;
+                self.h_scroll = h_scroll;
+                self.clamp_scroll();
+                self.status = Some(if self.syntax {
+                    "syntax highlighting on".to_string()
+                } else {
+                    "syntax highlighting off".to_string()
                 });
             }
             KeyCode::Char('b') => self.cycle_base(),

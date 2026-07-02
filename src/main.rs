@@ -1,6 +1,7 @@
 mod app;
 mod diff;
 mod git;
+mod highlight;
 mod mcp;
 mod types;
 mod ui;
