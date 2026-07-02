@@ -2,7 +2,7 @@
 
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -19,6 +19,10 @@ use ratatui::Terminal;
 use crate::git::GitRepo;
 use crate::types::{DiffMode, FileEntry, FileStatus, SideBySideDiff};
 use crate::{diff, update};
+
+/// How long a footer notification stays visible before the shortcut
+/// hints come back.
+const STATUS_TTL: Duration = Duration::from_secs(2);
 
 /// Outcome of the background update check, shared with the checker thread.
 #[derive(Debug, Clone)]
@@ -46,7 +50,9 @@ pub struct App {
     pub(crate) compact: bool,
     /// Whether the changed-files panel is visible.
     pub(crate) show_files: bool,
-    pub(crate) status: Option<String>,
+    /// Transient footer notification and when it was set; cleared after
+    /// [`STATUS_TTL`] so the shortcut hints reappear.
+    pub(crate) status: Option<(String, Instant)>,
     pub(crate) update_state: Arc<Mutex<UpdateState>>,
     pub(crate) base_choices: Vec<String>,
     pub(crate) quit: bool,
@@ -97,6 +103,21 @@ impl App {
         }
     }
 
+    /// Show a transient notification in the footer; it expires after
+    /// [`STATUS_TTL`].
+    fn set_status(&mut self, msg: impl Into<String>) {
+        self.status = Some((msg.into(), Instant::now()));
+    }
+
+    /// Clear the notification once its display time has elapsed.
+    pub(crate) fn expire_status(&mut self) {
+        if let Some((_, set_at)) = &self.status {
+            if set_at.elapsed() >= STATUS_TTL {
+                self.status = None;
+            }
+        }
+    }
+
     /// Whether the app is exiting specifically to perform a self-update.
     pub(crate) fn pending_update(&self) -> bool {
         self.awaiting_update_exit
@@ -114,7 +135,7 @@ impl App {
             }
             Err(e) => {
                 self.files.clear();
-                self.status = Some(format!("error: {e}"));
+                self.set_status(format!("error: {e}"));
             }
         }
         self.reload_diff();
@@ -131,7 +152,7 @@ impl App {
             return;
         };
         if entry.binary {
-            self.status = Some("binary file".to_string());
+            self.set_status("binary file".to_string());
             return;
         }
         match self.repo.file_versions(&self.mode, &entry) {
@@ -147,7 +168,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.status = Some(format!("error: {e}"));
+                self.set_status(format!("error: {e}"));
             }
         }
     }
@@ -190,7 +211,7 @@ impl App {
 
     fn cycle_base(&mut self) {
         if self.base_choices.is_empty() {
-            self.status = Some("no local branches found".to_string());
+            self.set_status("no local branches found".to_string());
             return;
         }
         let current_pos = self
@@ -209,7 +230,7 @@ impl App {
             *base = next_base.clone();
             self.reload();
         }
-        self.status = Some(format!("base: {next_base}"));
+        self.set_status(format!("base: {next_base}"));
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
@@ -267,7 +288,7 @@ impl App {
                 self.mode = self.mode.next(&self.base);
                 let label = self.mode.label();
                 self.reload();
-                self.status = Some(label);
+                self.set_status(label);
             }
             KeyCode::Char('f') => {
                 self.show_files = !self.show_files;
@@ -275,7 +296,7 @@ impl App {
             KeyCode::Char('c') => {
                 self.compact = !self.compact;
                 self.clamp_scroll();
-                self.status = Some(if self.compact {
+                self.set_status(if self.compact {
                     "compact view: filler rows hidden (panes scroll independently)".to_string()
                 } else {
                     "aligned view: filler rows shown".to_string()
@@ -289,7 +310,7 @@ impl App {
                 self.scroll = scroll;
                 self.h_scroll = h_scroll;
                 self.clamp_scroll();
-                self.status = Some(if self.syntax {
+                self.set_status(if self.syntax {
                     "syntax highlighting on".to_string()
                 } else {
                     "syntax highlighting off".to_string()
@@ -298,7 +319,7 @@ impl App {
             KeyCode::Char('b') => self.cycle_base(),
             KeyCode::Char('r') => {
                 self.reload();
-                self.status = Some("reloaded".to_string());
+                self.set_status("reloaded".to_string());
             }
             KeyCode::Char('U') => {
                 self.trigger_update = true;
@@ -396,6 +417,8 @@ fn event_loop(
             crate::ui::draw(f, app);
         })?;
 
+        app.expire_status();
+
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -419,7 +442,7 @@ fn event_loop(
                     app.quit = true;
                 }
                 UpdateState::Checking => {
-                    app.status = Some("update check still in progress…".to_string());
+                    app.set_status("update check still in progress…");
                 }
                 UpdateState::UpToDate | UpdateState::Failed(_) => {
                     // Re-check on demand: up-to-date may be stale, and a
@@ -428,7 +451,7 @@ fn event_loop(
                         *slot = UpdateState::Checking;
                     }
                     spawn_update_check(app.update_state.clone());
-                    app.status = Some(match state {
+                    app.set_status(match state {
                         UpdateState::Failed(e) => {
                             let brief = e.lines().next().unwrap_or("").to_string();
                             format!("last check failed ({brief}) — retrying…")

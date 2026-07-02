@@ -59,7 +59,7 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let line = if let Some(status) = &app.status {
+    let line = if let Some((status, _)) = &app.status {
         Line::from(Span::styled(
             format!(" {status}"),
             Style::default().fg(Color::Yellow),
