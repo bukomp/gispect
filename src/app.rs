@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -18,6 +19,15 @@ use ratatui::Terminal;
 use crate::git::GitRepo;
 use crate::types::{DiffMode, FileEntry, FileStatus, SideBySideDiff};
 use crate::{diff, update};
+
+/// Outcome of the background update check, shared with the checker thread.
+#[derive(Debug, Clone)]
+pub(crate) enum UpdateState {
+    Checking,
+    UpToDate,
+    Available(String),
+    Failed(String),
+}
 
 /// All state needed to render and drive the TUI.
 pub struct App {
@@ -37,7 +47,7 @@ pub struct App {
     /// Whether the changed-files panel is visible.
     pub(crate) show_files: bool,
     pub(crate) status: Option<String>,
-    pub(crate) update_available: Arc<Mutex<Option<String>>>,
+    pub(crate) update_state: Arc<Mutex<UpdateState>>,
     pub(crate) base_choices: Vec<String>,
     pub(crate) quit: bool,
     pub(crate) last_viewport_height: usize,
@@ -74,7 +84,7 @@ impl App {
             compact: false,
             show_files: true,
             status: None,
-            update_available: Arc::new(Mutex::new(None)),
+            update_state: Arc::new(Mutex::new(UpdateState::Checking)),
             base_choices,
             quit: false,
             last_viewport_height: 20,
@@ -297,6 +307,28 @@ impl App {
             _ => {}
         }
     }
+
+    fn handle_mouse(&mut self, kind: MouseEventKind) {
+        if self.show_help {
+            return;
+        }
+        match kind {
+            MouseEventKind::ScrollDown => {
+                self.scroll = self.scroll.saturating_add(3);
+                self.clamp_scroll();
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(3);
+            }
+            MouseEventKind::ScrollRight => {
+                self.h_scroll = self.h_scroll.saturating_add(4);
+            }
+            MouseEventKind::ScrollLeft => {
+                self.h_scroll = self.h_scroll.saturating_sub(4);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Restores the terminal on drop, even on panic/early return.
@@ -305,7 +337,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
     }
 }
 
@@ -313,18 +345,10 @@ pub fn run(repo: GitRepo, mode: DiffMode) -> Result<()> {
     let mut app = App::new(repo, mode);
     app.reload();
 
-    // Background update check; ignore errors silently.
-    let update_slot = app.update_available.clone();
-    std::thread::spawn(move || {
-        if let Ok(Some(hash)) = update::check_for_update() {
-            if let Ok(mut slot) = update_slot.lock() {
-                *slot = Some(hash);
-            }
-        }
-    });
+    spawn_update_check(app.update_state.clone());
 
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen)?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     let _guard = TerminalGuard;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -334,7 +358,7 @@ pub fn run(repo: GitRepo, mode: DiffMode) -> Result<()> {
     // Explicitly restore before doing anything post-loop (e.g. printing
     // update output); the guard will also restore on drop as a fallback.
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
 
     if app.pending_update() {
         println!("Updating gispect...");
@@ -345,6 +369,21 @@ pub fn run(repo: GitRepo, mode: DiffMode) -> Result<()> {
     }
 
     result
+}
+
+/// Run `update::check_for_update` on a background thread, storing the
+/// outcome (including failures) in the shared state slot.
+fn spawn_update_check(slot: Arc<Mutex<UpdateState>>) {
+    std::thread::spawn(move || {
+        let state = match update::check_for_update() {
+            Ok(Some(hash)) => UpdateState::Available(hash),
+            Ok(None) => UpdateState::UpToDate,
+            Err(e) => UpdateState::Failed(e.to_string()),
+        };
+        if let Ok(mut guard) = slot.lock() {
+            *guard = state;
+        }
+    });
 }
 
 fn event_loop(
@@ -358,20 +397,45 @@ fn event_loop(
         })?;
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key.code, key.modifiers);
                 }
+                Event::Mouse(mouse) => app.handle_mouse(mouse.kind),
+                _ => {}
             }
         }
 
         if app.trigger_update {
             app.trigger_update = false;
-            if app.update_available.lock().ok().and_then(|g| g.clone()).is_some() {
-                app.awaiting_update_exit = true;
-                app.quit = true;
-            } else {
-                app.status = Some("no update available".to_string());
+            let state = app
+                .update_state
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or(UpdateState::Checking);
+            match state {
+                UpdateState::Available(_) => {
+                    app.awaiting_update_exit = true;
+                    app.quit = true;
+                }
+                UpdateState::Checking => {
+                    app.status = Some("update check still in progress…".to_string());
+                }
+                UpdateState::UpToDate | UpdateState::Failed(_) => {
+                    // Re-check on demand: up-to-date may be stale, and a
+                    // failed check deserves a retry.
+                    if let Ok(mut slot) = app.update_state.lock() {
+                        *slot = UpdateState::Checking;
+                    }
+                    spawn_update_check(app.update_state.clone());
+                    app.status = Some(match state {
+                        UpdateState::Failed(e) => {
+                            let brief = e.lines().next().unwrap_or("").to_string();
+                            format!("last check failed ({brief}) — retrying…")
+                        }
+                        _ => "checking for updates…".to_string(),
+                    });
+                }
             }
         }
 

@@ -56,8 +56,19 @@ pub fn check_for_update() -> Result<Option<String>> {
 /// originally installed with `cargo install`, since cargo replaces the
 /// existing binary in `~/.cargo/bin`.
 pub fn perform_update() -> Result<()> {
+    // net.git-fetch-with-cli makes cargo shell out to the system `git`, so
+    // user gitconfig (insteadOf rewrites, ssh agent, credential helpers)
+    // applies; cargo's built-in git client often can't authenticate.
     let status = Command::new("cargo")
-        .args(["install", "--git", repo_url().as_str(), "--force", "gispect"])
+        .args([
+            "install",
+            "--config",
+            "net.git-fetch-with-cli=true",
+            "--git",
+            repo_url().as_str(),
+            "--force",
+            "gispect",
+        ])
         .status()
         .context("failed to run `cargo install` — is cargo installed?")?;
 

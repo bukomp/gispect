@@ -38,14 +38,20 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         app.files.len()
     ))];
 
-    let update_hash = app.update_available.lock().ok().and_then(|g| g.clone());
-    if update_hash.is_some() {
-        spans.push(Span::styled(
-            "  UPDATE AVAILABLE (press U)",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
+    if let Ok(state) = app.update_state.lock() {
+        match &*state {
+            crate::app::UpdateState::Available(hash) => spans.push(Span::styled(
+                format!("  UPDATE AVAILABLE: {} (press U)", &hash[..hash.len().min(7)]),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            crate::app::UpdateState::Failed(_) => spans.push(Span::styled(
+                "  update check failed (U to retry)",
+                Style::default().fg(Color::Red).add_modifier(Modifier::DIM),
+            )),
+            crate::app::UpdateState::Checking | crate::app::UpdateState::UpToDate => {}
+        }
     }
 
     let line = Line::from(spans);
@@ -329,7 +335,7 @@ fn center_vertically(area: Rect, content_height: u16) -> Rect {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let width = 50u16.min(area.width);
-    let height = 17u16.min(area.height);
+    let height = 18u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect { x, y, width, height };
@@ -346,6 +352,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("PgDn / PgUp  half-page scroll"),
         Line::from("g / G        top / bottom of diff"),
         Line::from("h/l ← →      scroll horizontally"),
+        Line::from("mouse wheel  scroll diff (shift: horizontal)"),
         Line::from("m            cycle diff mode"),
         Line::from("c            toggle compact view (hide filler)"),
         Line::from("s            toggle syntax highlighting"),

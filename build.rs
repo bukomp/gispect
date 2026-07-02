@@ -17,6 +17,14 @@ fn main() {
         .unwrap_or_else(|_| "https://github.com/bukomp/gispect".to_string());
     println!("cargo:rustc-env=GISPECT_REPO_URL={repo_url}");
 
+    // `.git/HEAD` only changes on branch switches; the current branch's ref
+    // file (and packed-refs) is what moves on each commit.
     println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(reference) = head.trim().strip_prefix("ref: ") {
+            println!("cargo:rerun-if-changed=.git/{reference}");
+        }
+    }
     println!("cargo:rerun-if-env-changed=GISPECT_REPO_URL");
 }
