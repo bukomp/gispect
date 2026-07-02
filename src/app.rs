@@ -82,6 +82,10 @@ pub struct App {
     pub(crate) compact: bool,
     /// Whether the changed-files panel is visible.
     pub(crate) show_files: bool,
+    /// Whether the old (left) diff pane is visible.
+    pub(crate) show_old: bool,
+    /// Whether the new (right) diff pane is visible.
+    pub(crate) show_new: bool,
     /// Transient footer notification and when it was set; cleared after
     /// [`STATUS_TTL`] so the shortcut hints reappear.
     pub(crate) status: Option<(String, Instant)>,
@@ -135,6 +139,8 @@ impl App {
             show_help: false,
             compact: false,
             show_files: true,
+            show_old: true,
+            show_new: true,
             status: None,
             update_state: Arc::new(Mutex::new(UpdateState::Checking)),
             base_choices,
@@ -299,7 +305,11 @@ impl App {
         if self.compact {
             let left = self.diff.rows.iter().filter(|r| r.left.is_some()).count();
             let right = self.diff.rows.iter().filter(|r| r.right.is_some()).count();
-            left.max(right)
+            match (self.show_old, self.show_new) {
+                (true, false) => left,
+                (false, true) => right,
+                _ => left.max(right),
+            }
         } else {
             self.diff.rows.len()
         }
@@ -337,7 +347,11 @@ impl App {
         }
         let left = self.diff.rows[..idx].iter().filter(|r| r.left.is_some()).count();
         let right = self.diff.rows[..idx].iter().filter(|r| r.right.is_some()).count();
-        left.min(right)
+        match (self.show_old, self.show_new) {
+            (true, false) => left,
+            (false, true) => right,
+            _ => left.min(right),
+        }
     }
 
     /// Jump to the next (`forward`) or previous change hunk relative to the
@@ -388,6 +402,27 @@ impl App {
             self.selected -= 1;
         }
         self.reload_diff();
+    }
+
+    /// Toggle one of the diff panes, keeping at least one visible.
+    fn toggle_pane(&mut self, left: bool) {
+        let (this, other) = if left {
+            (&mut self.show_old, self.show_new)
+        } else {
+            (&mut self.show_new, self.show_old)
+        };
+        if *this && !other {
+            self.set_status("at least one pane must stay visible".to_string());
+            return;
+        }
+        *this = !*this;
+        self.clamp_scroll();
+        let name = if left { "old" } else { "new" };
+        let shown = if left { self.show_old } else { self.show_new };
+        self.set_status(format!(
+            "{name} pane {}",
+            if shown { "shown" } else { "hidden" }
+        ));
     }
 
     fn cycle_base(&mut self) {
@@ -476,6 +511,8 @@ impl App {
             KeyCode::Char('f') => {
                 self.show_files = !self.show_files;
             }
+            KeyCode::Char('1') => self.toggle_pane(true),
+            KeyCode::Char('2') => self.toggle_pane(false),
             KeyCode::Char('c') => {
                 self.compact = !self.compact;
                 self.clamp_scroll();

@@ -66,7 +66,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  n/N change  m mode  c compact  s syntax  f files  b base  r reload  U update  ? help  q quit",
+            " j/k files  J/K scroll  n/N change  m mode  c compact  s syntax  f files  1/2 old/new  b base  r reload  U update  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
@@ -85,17 +85,24 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
         area
     };
 
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(diff_area);
-
-    draw_diff_pane(f, app, panes[0], true);
-    draw_diff_pane(f, app, panes[1], false);
+    match (app.show_old, app.show_new) {
+        (true, true) => {
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(diff_area);
+            draw_diff_pane(f, app, panes[0], true);
+            draw_diff_pane(f, app, panes[1], false);
+        }
+        (true, false) => draw_diff_pane(f, app, diff_area, true),
+        (false, true) => draw_diff_pane(f, app, diff_area, false),
+        // toggle_pane never allows both panes hidden.
+        (false, false) => {}
+    }
 }
 
 fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title("Files");
+    let block = Block::default().borders(Borders::ALL).title("Files [f]");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -162,10 +169,10 @@ fn draw_diff_pane(f: &mut Frame, app: &App, area: Rect, is_left: bool) {
     // With the file list hidden, show the selected path in the pane title
     // so the user keeps their bearings.
     let title = match (is_left, app.show_files, app.files.get(app.selected)) {
-        (true, false, Some(e)) => format!("Old — {}", e.path),
-        (false, false, Some(e)) => format!("New — {}", e.path),
-        (true, ..) => "Old".to_string(),
-        (false, ..) => "New".to_string(),
+        (true, false, Some(e)) => format!("Old [1] — {}", e.path),
+        (false, false, Some(e)) => format!("New [2] — {}", e.path),
+        (true, ..) => "Old [1]".to_string(),
+        (false, ..) => "New [2]".to_string(),
     };
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
@@ -335,7 +342,7 @@ fn center_vertically(area: Rect, content_height: u16) -> Rect {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let width = 50u16.min(area.width);
-    let height = 19u16.min(area.height);
+    let height = 20u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect { x, y, width, height };
@@ -358,6 +365,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("c            toggle compact view (hide filler)"),
         Line::from("s            toggle syntax highlighting"),
         Line::from("f            toggle file list panel"),
+        Line::from("1 / 2        toggle old / new pane"),
         Line::from("b            cycle base branch"),
         Line::from("r            reload"),
         Line::from("U            apply update"),
