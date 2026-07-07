@@ -82,6 +82,8 @@ pub struct App {
     pub(crate) compact: bool,
     /// Whether the changed-files panel is visible.
     pub(crate) show_files: bool,
+    /// Whether the file panel renders as a directory tree (vs a flat list).
+    pub(crate) tree_view: bool,
     /// Whether the old (left) diff pane is visible.
     pub(crate) show_old: bool,
     /// Whether the new (right) diff pane is visible.
@@ -139,6 +141,7 @@ impl App {
             show_help: false,
             compact: false,
             show_files: true,
+            tree_view: false,
             show_old: true,
             show_new: true,
             status: None,
@@ -510,6 +513,14 @@ impl App {
             }
             KeyCode::Char('f') => {
                 self.show_files = !self.show_files;
+            }
+            KeyCode::Char('t') => {
+                self.tree_view = !self.tree_view;
+                self.set_status(if self.tree_view {
+                    "file panel: tree view".to_string()
+                } else {
+                    "file panel: list view".to_string()
+                });
             }
             KeyCode::Char('1') => self.toggle_pane(true),
             KeyCode::Char('2') => self.toggle_pane(false),

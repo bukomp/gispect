@@ -66,7 +66,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  n/N change  m mode  c compact  s syntax  f files  1/2 old/new  b base  r reload  U update  ? help  q quit",
+            " j/k files  J/K scroll  n/N change  m mode  c compact  s syntax  f files  t tree  1/2 old/new  b base  r reload  U update  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
@@ -101,8 +101,20 @@ fn draw_body(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// One visual row of the file panel: a selectable file (with its index
+/// into `app.files`) or a non-selectable directory header in tree view.
+struct FileRow<'a> {
+    file_idx: Option<usize>,
+    spans: Vec<Span<'a>>,
+}
+
 fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title("Files [f]");
+    let title = format!(
+        "Files ({}) [f] {} [t]",
+        app.files.len(),
+        if app.tree_view { "tree" } else { "list" }
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -113,41 +125,150 @@ fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
+    let rows = if app.tree_view {
+        tree_rows(app)
+    } else {
+        list_rows(app)
+    };
+
     let height = inner.height as usize;
-    let offset = window_offset(app.selected, app.files.len(), height);
+    let selected_row = rows
+        .iter()
+        .position(|r| r.file_idx == Some(app.selected))
+        .unwrap_or(0);
+    let offset = window_offset(selected_row, rows.len(), height);
 
     let mut lines = Vec::with_capacity(height);
-    for (i, entry) in app.files.iter().enumerate().skip(offset).take(height) {
-        let marker = entry.status.marker();
-        let marker_color = match &entry.status {
-            FileStatus::Added => Color::Green,
-            FileStatus::Modified => Color::Yellow,
-            FileStatus::Deleted => Color::Red,
-            FileStatus::Renamed { .. } => Color::Cyan,
-            FileStatus::Other(_) => Color::White,
-        };
-
-        let mut spans = vec![
-            Span::styled(format!("{marker} "), Style::default().fg(marker_color)),
-            Span::raw(entry.path.clone()),
-            Span::raw("  "),
-            Span::styled(format!("+{}", entry.additions), Style::default().fg(Color::Green)),
-            Span::raw(" "),
-            Span::styled(format!("-{}", entry.deletions), Style::default().fg(Color::Red)),
-        ];
-
-        let mut style = Style::default();
-        if i == app.selected {
-            style = style.add_modifier(Modifier::REVERSED);
+    for row in rows.into_iter().skip(offset).take(height) {
+        let mut spans = row.spans;
+        if row.file_idx == Some(app.selected) {
+            let style = Style::default().add_modifier(Modifier::REVERSED);
             for span in spans.iter_mut() {
                 span.style = span.style.patch(style);
             }
         }
-
         lines.push(Line::from(spans));
     }
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Marker character span (A/M/D/R…) colored by file status.
+fn marker_span(status: &FileStatus) -> Span<'static> {
+    let color = match status {
+        FileStatus::Added => Color::Green,
+        FileStatus::Modified => Color::Yellow,
+        FileStatus::Deleted => Color::Red,
+        FileStatus::Renamed { .. } => Color::Cyan,
+        FileStatus::Other(_) => Color::White,
+    };
+    Span::styled(format!("{} ", status.marker()), Style::default().fg(color))
+}
+
+/// `+N -M` change-count spans for one file entry.
+fn count_spans(entry: &crate::types::FileEntry) -> Vec<Span<'static>> {
+    vec![
+        Span::raw("  "),
+        Span::styled(format!("+{}", entry.additions), Style::default().fg(Color::Green)),
+        Span::raw(" "),
+        Span::styled(format!("-{}", entry.deletions), Style::default().fg(Color::Red)),
+    ]
+}
+
+/// Flat view: one row per file with its full path.
+fn list_rows(app: &App) -> Vec<FileRow<'static>> {
+    app.files
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let mut spans = vec![marker_span(&entry.status), Span::raw(entry.path.clone())];
+            spans.extend(count_spans(entry));
+            FileRow {
+                file_idx: Some(i),
+                spans,
+            }
+        })
+        .collect()
+}
+
+/// A node of the file-panel tree: a directory with children, or a leaf
+/// file carrying its index into `app.files`.
+enum TreeNode {
+    Dir { name: String, children: Vec<TreeNode> },
+    File { idx: usize, name: String },
+}
+
+/// Tree view: directories and files rendered with `tree`-style ASCII
+/// connectors (├──, └──, │). Files keep their `app.files` order (git
+/// emits paths sorted, so siblings group naturally).
+fn tree_rows(app: &App) -> Vec<FileRow<'static>> {
+    let mut roots: Vec<TreeNode> = Vec::new();
+
+    for (i, entry) in app.files.iter().enumerate() {
+        let mut parts: Vec<&str> = entry.path.split('/').collect();
+        let name = parts.pop().unwrap_or(entry.path.as_str()).to_string();
+
+        // Descend the directory chain, reusing the last child when it is
+        // the same directory (paths arrive sorted, so siblings are
+        // consecutive) and creating new dir nodes otherwise.
+        let mut children = &mut roots;
+        for part in parts {
+            let reuse = matches!(
+                children.last(),
+                Some(TreeNode::Dir { name, .. }) if name.as_str() == part
+            );
+            if !reuse {
+                children.push(TreeNode::Dir {
+                    name: part.to_string(),
+                    children: Vec::new(),
+                });
+            }
+            children = match children.last_mut() {
+                Some(TreeNode::Dir { children, .. }) => children,
+                _ => unreachable!("last child was just ensured to be a Dir"),
+            };
+        }
+        children.push(TreeNode::File { idx: i, name });
+    }
+
+    let mut rows = Vec::new();
+    emit_tree(&roots, "", app, &mut rows);
+    rows
+}
+
+/// Recursively render tree nodes into panel rows. `prefix` accumulates
+/// the `│   `/`    ` guides owed to ancestor levels.
+fn emit_tree(nodes: &[TreeNode], prefix: &str, app: &App, rows: &mut Vec<FileRow<'static>>) {
+    for (i, node) in nodes.iter().enumerate() {
+        let last = i + 1 == nodes.len();
+        let connector = if last { "└── " } else { "├── " };
+        let branch = Span::styled(
+            format!("{prefix}{connector}"),
+            Style::default().add_modifier(Modifier::DIM),
+        );
+        match node {
+            TreeNode::Dir { name, children } => {
+                rows.push(FileRow {
+                    file_idx: None,
+                    spans: vec![
+                        branch,
+                        Span::styled(format!("{name}/"), Style::default().fg(Color::Blue)),
+                    ],
+                });
+                let child_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
+                emit_tree(children, &child_prefix, app, rows);
+            }
+            TreeNode::File { idx, name } => {
+                let entry = &app.files[*idx];
+                let mut spans = vec![branch, marker_span(&entry.status), Span::raw(name.clone())];
+                spans.extend(count_spans(entry));
+                rows.push(FileRow {
+                    file_idx: Some(*idx),
+                    spans,
+                });
+            }
+        }
+    }
 }
 
 /// Compute a scroll offset that keeps `selected` visible within a list of
@@ -234,10 +355,10 @@ fn draw_diff_pane(f: &mut Frame, app: &App, area: Rect, is_left: bool) {
                     // Keep syntax foregrounds; mark diff roles with a
                     // background tint instead of overriding the foreground.
                     let bg = match (row.kind, is_left) {
-                        (RowKind::Removed, true) => Some(Color::Rgb(80, 30, 30)),
-                        (RowKind::Modified, true) => Some(Color::Rgb(80, 30, 30)),
-                        (RowKind::Added, false) => Some(Color::Rgb(25, 70, 35)),
-                        (RowKind::Modified, false) => Some(Color::Rgb(25, 70, 35)),
+                        (RowKind::Removed, true) => Some(Color::Rgb(52, 18, 18)),
+                        (RowKind::Modified, true) => Some(Color::Rgb(52, 18, 18)),
+                        (RowKind::Added, false) => Some(Color::Rgb(16, 45, 22)),
+                        (RowKind::Modified, false) => Some(Color::Rgb(16, 45, 22)),
                         _ => None,
                     };
                     if let Some(bg) = bg {
@@ -342,7 +463,7 @@ fn center_vertically(area: Rect, content_height: u16) -> Rect {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let width = 50u16.min(area.width);
-    let height = 20u16.min(area.height);
+    let height = 24u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect { x, y, width, height };
@@ -365,6 +486,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("c            toggle compact view (hide filler)"),
         Line::from("s            toggle syntax highlighting"),
         Line::from("f            toggle file list panel"),
+        Line::from("t            toggle file tree / list view"),
         Line::from("1 / 2        toggle old / new pane"),
         Line::from("b            cycle base branch"),
         Line::from("r            reload"),
