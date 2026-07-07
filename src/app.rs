@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 
 use crate::git::GitRepo;
@@ -56,6 +57,20 @@ struct HlUpdate {
     lines: Arc<HlLines>,
 }
 
+/// What the file panel actually showed on the last draw, recorded by the
+/// renderer so mouse events can be mapped back to panel rows.
+#[derive(Default)]
+pub(crate) struct FilePanelView {
+    /// Inner (borderless) area of the panel; zero-sized when hidden.
+    pub(crate) area: Rect,
+    /// Effective scroll offset after clamping.
+    pub(crate) offset: usize,
+    /// Total number of rows (tree view includes directory rows).
+    pub(crate) total: usize,
+    /// File index per visible row, top to bottom; `None` for dir rows.
+    pub(crate) rows: Vec<Option<usize>>,
+}
+
 /// Outcome of the background update check, shared with the checker thread.
 #[derive(Debug, Clone)]
 pub(crate) enum UpdateState {
@@ -84,6 +99,9 @@ pub struct App {
     pub(crate) show_files: bool,
     /// Whether the file panel renders as a directory tree (vs a flat list).
     pub(crate) tree_view: bool,
+    /// Whether the file panel expands to fit its widest row (vs the
+    /// fixed default width).
+    pub(crate) wide_files: bool,
     /// Whether the old (left) diff pane is visible.
     pub(crate) show_old: bool,
     /// Whether the new (right) diff pane is visible.
@@ -95,6 +113,16 @@ pub struct App {
     pub(crate) base_choices: Vec<String>,
     pub(crate) quit: bool,
     pub(crate) last_viewport_height: usize,
+    /// Inner height of the diff panes as of the last draw.
+    pub(crate) diff_height: usize,
+    /// Snapshot of the file panel from the last draw.
+    pub(crate) file_view: FilePanelView,
+    /// Manual file-panel scroll set by the mouse wheel / PgUp / PgDn;
+    /// `None` means the panel follows the selection.
+    pub(crate) file_scroll: Option<usize>,
+    /// Last known mouse position, used to route scrolling to the pane
+    /// under the cursor.
+    mouse_pos: (u16, u16),
     /// Whether syntax highlighting is enabled for the diff panes.
     pub(crate) syntax: bool,
     /// Highlighted segments for the left (old) pane, indexed by line - 1.
@@ -142,6 +170,7 @@ impl App {
             compact: false,
             show_files: true,
             tree_view: false,
+            wide_files: false,
             show_old: true,
             show_new: true,
             status: None,
@@ -149,6 +178,10 @@ impl App {
             base_choices,
             quit: false,
             last_viewport_height: 20,
+            diff_height: 20,
+            file_view: FilePanelView::default(),
+            file_scroll: None,
+            mouse_pos: (0, 0),
             syntax: true,
             left_hl: Arc::new(Vec::new()),
             right_hl: Arc::new(Vec::new()),
@@ -185,6 +218,7 @@ impl App {
     /// Reload the file list for the current mode, then reload the diff
     /// for the currently selected file.
     fn reload(&mut self) {
+        self.file_scroll = None;
         match self.repo.changed_files(&self.mode) {
             Ok(files) => {
                 self.files = files;
@@ -397,6 +431,7 @@ impl App {
         if self.selected + 1 < self.files.len() {
             self.selected += 1;
         }
+        self.file_scroll = None;
         self.reload_diff();
     }
 
@@ -404,7 +439,37 @@ impl App {
         if self.selected > 0 {
             self.selected -= 1;
         }
+        self.file_scroll = None;
         self.reload_diff();
+    }
+
+    /// Whether the mouse currently hovers the file panel.
+    fn over_files(&self) -> bool {
+        let (x, y) = self.mouse_pos;
+        self.show_files && self.file_view.area.contains(Position::new(x, y))
+    }
+
+    /// Scroll the file panel by `delta` rows, detaching it from the
+    /// selection until the user navigates with the keyboard again.
+    fn scroll_files(&mut self, delta: isize) {
+        let height = self.file_view.area.height as usize;
+        let max = self.file_view.total.saturating_sub(height) as isize;
+        let next = (self.file_view.offset as isize + delta).clamp(0, max.max(0));
+        self.file_scroll = Some(next as usize);
+    }
+
+    /// Select the file rendered on the clicked panel row, if any.
+    fn click_file(&mut self, row: u16) {
+        let inner = self.file_view.area;
+        let Some(visible_row) = row.checked_sub(inner.y) else {
+            return;
+        };
+        if let Some(Some(idx)) = self.file_view.rows.get(visible_row as usize).copied() {
+            if idx != self.selected {
+                self.selected = idx;
+                self.reload_diff();
+            }
+        }
     }
 
     /// Toggle one of the diff panes, keeping at least one visible.
@@ -485,13 +550,21 @@ impl App {
                 self.scroll = self.scroll.saturating_sub(half);
             }
             KeyCode::PageDown => {
-                let half = (self.last_viewport_height / 2).max(1);
-                self.scroll = self.scroll.saturating_add(half);
-                self.clamp_scroll();
+                if self.over_files() {
+                    self.scroll_files(self.file_view.area.height.max(1) as isize);
+                } else {
+                    let page = self.diff_height.max(1);
+                    self.scroll = self.scroll.saturating_add(page);
+                    self.clamp_scroll();
+                }
             }
             KeyCode::PageUp => {
-                let half = (self.last_viewport_height / 2).max(1);
-                self.scroll = self.scroll.saturating_sub(half);
+                if self.over_files() {
+                    self.scroll_files(-(self.file_view.area.height.max(1) as isize));
+                } else {
+                    let page = self.diff_height.max(1);
+                    self.scroll = self.scroll.saturating_sub(page);
+                }
             }
             KeyCode::Char('n') => self.jump_change(true),
             KeyCode::Char('N') => self.jump_change(false),
@@ -520,6 +593,17 @@ impl App {
                     "file panel: tree view".to_string()
                 } else {
                     "file panel: list view".to_string()
+                });
+            }
+            KeyCode::Char('F') => {
+                self.wide_files = !self.wide_files;
+                if self.wide_files && !self.show_files {
+                    self.show_files = true;
+                }
+                self.set_status(if self.wide_files {
+                    "file panel: expanded".to_string()
+                } else {
+                    "file panel: normal width".to_string()
                 });
             }
             KeyCode::Char('1') => self.toggle_pane(true),
@@ -560,23 +644,37 @@ impl App {
         }
     }
 
-    fn handle_mouse(&mut self, kind: MouseEventKind) {
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        self.mouse_pos = (mouse.column, mouse.row);
         if self.show_help {
             return;
         }
-        match kind {
+        match mouse.kind {
             MouseEventKind::ScrollDown => {
-                self.scroll = self.scroll.saturating_add(3);
-                self.clamp_scroll();
+                if self.over_files() {
+                    self.scroll_files(3);
+                } else {
+                    self.scroll = self.scroll.saturating_add(3);
+                    self.clamp_scroll();
+                }
             }
             MouseEventKind::ScrollUp => {
-                self.scroll = self.scroll.saturating_sub(3);
+                if self.over_files() {
+                    self.scroll_files(-3);
+                } else {
+                    self.scroll = self.scroll.saturating_sub(3);
+                }
             }
             MouseEventKind::ScrollRight => {
                 self.h_scroll = self.h_scroll.saturating_add(4);
             }
             MouseEventKind::ScrollLeft => {
                 self.h_scroll = self.h_scroll.saturating_sub(4);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.over_files() {
+                    self.click_file(mouse.row);
+                }
             }
             _ => {}
         }
@@ -706,7 +804,7 @@ fn event_loop(
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key.code, key.modifiers);
                 }
-                Event::Mouse(mouse) => app.handle_mouse(mouse.kind),
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => {}
             }
         }

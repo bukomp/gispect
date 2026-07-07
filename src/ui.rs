@@ -6,10 +6,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::App;
+use crate::app::{App, FilePanelView};
 use crate::types::{FileStatus, RowKind};
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -66,22 +66,29 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  n/N change  m mode  c compact  s syntax  f files  t tree  1/2 old/new  b base  r reload  U update  ? help  q quit",
+            " j/k files  J/K scroll  n/N change  m mode  c compact  s syntax  f files  t tree  F wide  1/2 old/new  b base  r reload  U update  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_body(f: &mut Frame, app: &App, area: Rect) {
+fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
     let diff_area = if app.show_files {
+        let rows = if app.tree_view {
+            tree_rows(app)
+        } else {
+            list_rows(app)
+        };
+        let width = file_panel_width(&rows, app.wide_files, area.width);
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(34), Constraint::Min(0)])
+            .constraints([Constraint::Length(width), Constraint::Min(0)])
             .split(area);
-        draw_file_list(f, app, chunks[0]);
+        draw_file_list(f, app, chunks[0], rows);
         chunks[1]
     } else {
+        app.file_view = FilePanelView::default();
         area
     };
 
@@ -108,35 +115,66 @@ struct FileRow<'a> {
     spans: Vec<Span<'a>>,
 }
 
-fn draw_file_list(f: &mut Frame, app: &App, area: Rect) {
+/// Width of the file panel: fixed by default, sized to the widest row
+/// (plus borders) when expanded — capped so the diff keeps some room.
+fn file_panel_width(rows: &[FileRow], wide: bool, total_width: u16) -> u16 {
+    const DEFAULT_WIDTH: u16 = 34;
+    if !wide {
+        return DEFAULT_WIDTH.min(total_width);
+    }
+    let content = rows
+        .iter()
+        .map(|r| r.spans.iter().map(|s| s.width()).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let cap = (total_width as usize * 2) / 3;
+    ((content + 2).clamp(DEFAULT_WIDTH as usize, cap.max(DEFAULT_WIDTH as usize))) as u16
+}
+
+fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect, rows: Vec<FileRow<'static>>) {
     let title = format!(
-        "Files ({}) [f] {} [t]",
+        "Files ({}) [f] {} [t] {} [F]",
         app.files.len(),
-        if app.tree_view { "tree" } else { "list" }
+        if app.tree_view { "tree" } else { "list" },
+        if app.wide_files { "wide" } else { "auto" }
     );
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     if app.files.is_empty() {
+        app.file_view = FilePanelView {
+            area: inner,
+            ..FilePanelView::default()
+        };
         let msg = Paragraph::new("(no changed files)")
             .style(Style::default().add_modifier(Modifier::DIM));
         f.render_widget(msg, inner);
         return;
     }
 
-    let rows = if app.tree_view {
-        tree_rows(app)
-    } else {
-        list_rows(app)
-    };
-
     let height = inner.height as usize;
     let selected_row = rows
         .iter()
         .position(|r| r.file_idx == Some(app.selected))
         .unwrap_or(0);
-    let offset = window_offset(selected_row, rows.len(), height);
+    // A wheel/PgUp scroll detaches the panel from the selection; otherwise
+    // the window follows the selected file.
+    let offset = match app.file_scroll {
+        Some(o) => o.min(rows.len().saturating_sub(height)),
+        None => window_offset(selected_row, rows.len(), height),
+    };
+    app.file_view = FilePanelView {
+        area: inner,
+        offset,
+        total: rows.len(),
+        rows: rows
+            .iter()
+            .skip(offset)
+            .take(height)
+            .map(|r| r.file_idx)
+            .collect(),
+    };
 
     let mut lines = Vec::with_capacity(height);
     for row in rows.into_iter().skip(offset).take(height) {
@@ -286,7 +324,7 @@ fn window_offset(selected: usize, total: usize, height: usize) -> usize {
     }
 }
 
-fn draw_diff_pane(f: &mut Frame, app: &App, area: Rect, is_left: bool) {
+fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
     // With the file list hidden, show the selected path in the pane title
     // so the user keeps their bearings.
     let title = match (is_left, app.show_files, app.files.get(app.selected)) {
@@ -298,6 +336,8 @@ fn draw_diff_pane(f: &mut Frame, app: &App, area: Rect, is_left: bool) {
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    app.diff_height = inner.height as usize;
 
     if app.diff.rows.is_empty() {
         let msg = Paragraph::new("(no textual diff)")
@@ -463,7 +503,7 @@ fn center_vertically(area: Rect, content_height: u16) -> Rect {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let width = 50u16.min(area.width);
-    let height = 24u16.min(area.height);
+    let height = 26u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect { x, y, width, height };
@@ -477,16 +517,18 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("k / Up       previous file"),
         Line::from("J / K        scroll diff down / up"),
         Line::from("Ctrl-d/u     half-page scroll"),
-        Line::from("PgDn / PgUp  half-page scroll"),
+        Line::from("PgDn / PgUp  full-page scroll (pane under mouse)"),
         Line::from("n / N        next / previous change"),
         Line::from("g / G        top / bottom of diff"),
         Line::from("h/l ← →      scroll horizontally"),
-        Line::from("mouse wheel  scroll diff (shift: horizontal)"),
+        Line::from("mouse wheel  scroll pane under cursor"),
+        Line::from("mouse click  select file in the file panel"),
         Line::from("m            cycle diff mode"),
         Line::from("c            toggle compact view (hide filler)"),
         Line::from("s            toggle syntax highlighting"),
         Line::from("f            toggle file list panel"),
         Line::from("t            toggle file tree / list view"),
+        Line::from("F            expand file panel to fit names"),
         Line::from("1 / 2        toggle old / new pane"),
         Line::from("b            cycle base branch"),
         Line::from("r            reload"),
