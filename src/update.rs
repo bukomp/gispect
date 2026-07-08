@@ -79,6 +79,39 @@ pub fn perform_update() -> Result<()> {
     Ok(())
 }
 
+/// Replace the current process with a fresh invocation of the gispect
+/// binary, preserving the original CLI arguments. Called after a
+/// successful self-update, once the terminal has been restored, so the
+/// user lands back in the TUI running the new version.
+///
+/// On Unix this uses `exec` and only returns on failure. On other
+/// platforms it spawns a child, waits for it, and exits with its status
+/// code, so it also never returns `Ok` in practice.
+pub fn restart() -> Result<()> {
+    // `cargo install --force` overwrites the binary at this same path, so
+    // re-executing it picks up the freshly installed version.
+    let exe = std::env::current_exe().context("failed to resolve current executable path")?;
+    let args = std::env::args_os().skip(1);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let err = Command::new(&exe).args(args).exec();
+        // `exec` only returns on failure — if we get here, the exec failed.
+        Err(err).with_context(|| format!("failed to exec {}", exe.display()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = Command::new(&exe)
+            .args(args)
+            .status()
+            .with_context(|| format!("failed to spawn {}", exe.display()))?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+}
+
 /// Short (7-char) form of a commit hash, for readable status messages.
 fn short(hash: &str) -> &str {
     &hash[..hash.len().min(7)]

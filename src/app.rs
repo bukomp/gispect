@@ -773,7 +773,12 @@ pub fn run(repo: GitRepo, mode: DiffMode) -> Result<()> {
     if app.pending_update() {
         println!("Updating gispect...");
         match update::perform_update() {
-            Ok(()) => println!("Update complete. Please restart gispect."),
+            Ok(()) => {
+                println!("Update complete. Restarting gispect...");
+                if let Err(e) = update::restart() {
+                    println!("Restart failed: {e}. Please restart gispect manually.");
+                }
+            }
             Err(e) => println!("Update failed: {e}"),
         }
     }

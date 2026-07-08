@@ -52,7 +52,7 @@ Cycle with `m`:
 | `s` | toggle syntax highlighting |
 | `b` | cycle base branch |
 | `r` | reload |
-| `U` | apply available update |
+| `U` | apply available update and restart into the new version |
 | `?` | help overlay |
 | `q` / `Esc` | quit |
 
@@ -87,4 +87,6 @@ press `U`) runs `git ls-remote <repo-url> HEAD`; when upstream has new commits
 it reinstalls via `cargo install --git <repo-url> --force`, which replaces the
 binary in `~/.cargo/bin` — so it works for `cargo install`-ed binaries too.
 Requires `git` and `cargo` on `PATH`. Binaries built from a tree without
-commits report `unknown` and always offer the update.
+commits report `unknown` and always offer the update. Applying the update from
+the TUI (`U`) restarts gispect in place on the new binary with the same
+arguments; `gispect update` from the CLI reinstalls and exits.
