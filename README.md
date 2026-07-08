@@ -44,7 +44,7 @@ Cycle with `m`:
 |---|---|
 | `j` / `k`, `↓` / `↑` | select file |
 | `J` / `K`, `PgDn` / `PgUp`, `Ctrl-d` / `Ctrl-u` | scroll diff |
-| `n` / `N` | jump to next / previous change |
+| `n` / `N` | jump to next / previous change; jumps to next / previous search match instead while a search is active |
 | `g` / `G` | top / bottom of diff |
 | `h` / `l`, `←` / `→` | horizontal scroll |
 | `m` | cycle diff mode |
@@ -52,9 +52,28 @@ Cycle with `m`:
 | `s` | toggle syntax highlighting |
 | `b` | cycle base branch |
 | `r` | reload |
+| `/` | search code in the current file's diff |
+| `S` | search code across all changed files |
+| `p` | filter the file panel by file/folder name |
 | `U` | apply available update and restart into the new version |
 | `?` | help overlay |
 | `q` / `Esc` | quit |
+
+## Search
+
+- `/` searches within the currently selected file's diff. While a search is
+  active, `n` / `N` jump to the next / previous match instead of the next /
+  previous change hunk, and `Esc` clears the search.
+- `S` searches across every changed file and opens a results popup listing
+  `path:line: content` for each match. `j` / `k` move the selection, `Enter`
+  opens the selected match — jumping to that file and line with the query
+  still highlighted — and `Esc` closes the popup.
+- `p` filters the file panel to files/folders whose path contains the typed
+  text (case-insensitive substring match), updating live as you type. `Enter`
+  keeps the filter applied; `Esc` clears it.
+- All searches are smart-case: an all-lowercase query matches
+  case-insensitively, while a query containing an uppercase letter matches
+  case-sensitively.
 
 ## MCP server
 

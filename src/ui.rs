@@ -22,7 +22,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_status_bar(f, app, chunks[0]);
     draw_body(f, app, chunks[1]);
-    draw_footer(f, app, chunks[2]);
+    // Footer priority: active prompt, then transient status, then the
+    // persistent search line, then the default hints.
+    let status_pending = app.status.is_some() && app.search_input.is_none();
+    if status_pending || !crate::search_ui::draw_search_footer(f, app, chunks[2]) {
+        draw_footer(f, app, chunks[2]);
+    }
+
+    crate::search_ui::draw_project_results(f, app, area);
 
     if app.show_help {
         draw_help(f, area);
@@ -66,7 +73,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  n/N change  m mode  c compact  s syntax  f files  t tree  F wide  1/2 old/new  b base  r reload  U update  ? help  q quit",
+            " j/k files  J/K scroll  n/N change  / search  S search-all  p filter  m mode  c compact  s syntax  f files  t tree  F wide  1/2 old/new  b base  r reload  U update  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
@@ -135,9 +142,19 @@ fn file_panel_width(rows: &[FileRow], wide: bool, total_width: u16) -> u16 {
 }
 
 fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect, rows: Vec<FileRow<'static>>) {
+    // With a path filter active, show visible/total so hidden files are
+    // accounted for at a glance.
+    let count = match app.active_path_filter() {
+        Some(_) => format!(
+            "{}/{}",
+            rows.iter().filter(|r| r.file_idx.is_some()).count(),
+            app.files.len()
+        ),
+        None => app.files.len().to_string(),
+    };
     let title = format!(
         "Files ({}) [f] {} [t] {} [F]",
-        app.files.len(),
+        count,
         if app.tree_view { "tree" } else { "list" },
         if app.wide_files { "wide" } else { "auto" }
     );
@@ -145,13 +162,17 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect, rows: Vec<FileRow<'s
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if app.files.is_empty() {
+    if rows.is_empty() {
         app.file_view = FilePanelView {
             area: inner,
             ..FilePanelView::default()
         };
-        let msg = Paragraph::new("(no changed files)")
-            .style(Style::default().add_modifier(Modifier::DIM));
+        let msg = Paragraph::new(if app.files.is_empty() {
+            "(no changed files)"
+        } else {
+            "(no files match filter)"
+        })
+        .style(Style::default().add_modifier(Modifier::DIM));
         f.render_widget(msg, inner);
         return;
     }
@@ -225,11 +246,13 @@ fn count_spans(entry: &crate::types::FileEntry) -> Vec<Span<'static>> {
     ]
 }
 
-/// Flat view: one row per file with its full path.
+/// Flat view: one row per file with its full path. Files hidden by the
+/// active path filter are skipped.
 fn list_rows(app: &App) -> Vec<FileRow<'static>> {
     app.files
         .iter()
         .enumerate()
+        .filter(|(i, _)| app.passes_filter(*i))
         .map(|(i, entry)| {
             let mut spans = vec![marker_span(&entry.status), Span::raw(entry.path.clone())];
             spans.extend(count_spans(entry));
@@ -254,7 +277,12 @@ enum TreeNode {
 fn tree_rows(app: &App) -> Vec<FileRow<'static>> {
     let mut roots: Vec<TreeNode> = Vec::new();
 
-    for (i, entry) in app.files.iter().enumerate() {
+    for (i, entry) in app
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| app.passes_filter(*i))
+    {
         let mut parts: Vec<&str> = entry.path.split('/').collect();
         let name = parts.pop().unwrap_or(entry.path.as_str()).to_string();
 
@@ -370,21 +398,23 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
 
     // In compact mode drop rows that are pure filler for this pane, so the
     // code reads contiguously (panes then scroll independently of alignment).
-    let rows: Vec<&crate::types::DiffRow> = if app.compact {
+    // Rows keep their aligned index so search matches can be looked up.
+    let rows: Vec<(usize, &crate::types::DiffRow)> = if app.compact {
         app.diff
             .rows
             .iter()
-            .filter(|r| if is_left { r.left.is_some() } else { r.right.is_some() })
+            .enumerate()
+            .filter(|(_, r)| if is_left { r.left.is_some() } else { r.right.is_some() })
             .collect()
     } else {
-        app.diff.rows.iter().collect()
+        app.diff.rows.iter().enumerate().collect()
     };
 
     let start = app.scroll.min(rows.len().saturating_sub(1));
     let end = (start + height).min(rows.len());
 
     let mut lines = Vec::with_capacity(height);
-    for row in &rows[start..end] {
+    for (row_idx, row) in &rows[start..end] {
         let cell = if is_left { &row.left } else { &row.right };
 
         let (line_no_str, segments): (String, Vec<(Style, String)>) = match cell {
@@ -458,6 +488,20 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
             ),
         };
 
+        // Tint search matches on top of whatever styling the row already
+        // has; the current (n/N cursor) match gets a brighter tint.
+        let segments = match &app.file_search {
+            Some(fs) => {
+                let bg = if fs.matches.get(fs.current).map(|m| m.row) == Some(*row_idx) {
+                    crate::search_ui::CURRENT_MATCH_BG
+                } else {
+                    crate::search_ui::MATCH_BG
+                };
+                crate::search::highlight_segments(&segments, &fs.query, Style::default().bg(bg))
+            }
+            None => segments,
+        };
+
         let content_width = width.saturating_sub(line_no_str.len());
         let h_scroll = if is_left { app.h_scroll_old } else { app.h_scroll_new };
         let sliced = slice_segments(&segments, h_scroll, content_width);
@@ -520,8 +564,8 @@ fn center_vertically(area: Rect, content_height: u16) -> Rect {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let width = 50u16.min(area.width);
-    let height = 26u16.min(area.height);
+    let width = 52u16.min(area.width);
+    let height = 30u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect { x, y, width, height };
@@ -536,8 +580,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("J / K        scroll diff down / up"),
         Line::from("Ctrl-d/u     half-page scroll"),
         Line::from("PgDn / PgUp  full-page scroll (pane under mouse)"),
-        Line::from("n / N        next / previous change"),
+        Line::from("n / N        next / previous change (or match)"),
         Line::from("g / G        top / bottom of diff"),
+        Line::from("/            search in current file"),
+        Line::from("S            search all changed files"),
+        Line::from("p            filter file panel by name"),
+        Line::from("Esc          clear search / filter, then quit"),
         Line::from("h/l ← →      h-scroll pane under mouse"),
         Line::from("mouse wheel  scroll pane under cursor"),
         Line::from("mouse click  select file in the file panel"),

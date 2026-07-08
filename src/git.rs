@@ -265,6 +265,15 @@ impl GitRepo {
         ))
     }
 
+    /// (old, new) contents for every entry, parallel to `files`. Sides that
+    /// cannot be read degrade to ""; binary entries yield ("", "").
+    pub fn all_file_contents(&self, mode: &DiffMode, files: &[FileEntry]) -> Vec<(String, String)> {
+        files
+            .iter()
+            .map(|entry| self.file_versions(mode, entry).unwrap_or_default())
+            .collect()
+    }
+
     /// Fetch the "old" side of a diff for `mode`, returning `None` if it
     /// cannot be read.
     fn old_side(&self, mode: &DiffMode, old_path: &str) -> Option<String> {

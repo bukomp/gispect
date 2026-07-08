@@ -3,6 +3,8 @@ mod diff;
 mod git;
 mod highlight;
 mod mcp;
+mod search;
+mod search_ui;
 mod types;
 mod ui;
 mod update;
