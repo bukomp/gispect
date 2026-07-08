@@ -90,7 +90,12 @@ pub struct App {
     pub(crate) selected: usize,
     pub(crate) diff: SideBySideDiff,
     pub(crate) scroll: usize,
-    pub(crate) h_scroll: usize,
+    /// Horizontal scroll offset of the old (left) diff pane.
+    pub(crate) h_scroll_old: usize,
+    /// Horizontal scroll offset of the new (right) diff pane.
+    pub(crate) h_scroll_new: usize,
+    /// Horizontal scroll offset of the file panel.
+    pub(crate) h_scroll_files: usize,
     pub(crate) show_help: bool,
     /// Compact view: hide alignment filler rows so each pane shows its
     /// version of the file contiguously.
@@ -117,6 +122,14 @@ pub struct App {
     pub(crate) diff_height: usize,
     /// Snapshot of the file panel from the last draw.
     pub(crate) file_view: FilePanelView,
+    /// Inner area of the old (left) diff pane as of the last draw,
+    /// recorded by the renderer so mouse events can be routed; zero-sized
+    /// when the pane is hidden.
+    pub(crate) old_pane_area: Rect,
+    /// Inner area of the new (right) diff pane as of the last draw,
+    /// recorded by the renderer so mouse events can be routed; zero-sized
+    /// when the pane is hidden.
+    pub(crate) new_pane_area: Rect,
     /// Manual file-panel scroll set by the mouse wheel / PgUp / PgDn;
     /// `None` means the panel follows the selection.
     pub(crate) file_scroll: Option<usize>,
@@ -165,7 +178,9 @@ impl App {
             selected: 0,
             diff: SideBySideDiff::default(),
             scroll: 0,
-            h_scroll: 0,
+            h_scroll_old: 0,
+            h_scroll_new: 0,
+            h_scroll_files: 0,
             show_help: false,
             compact: false,
             show_files: true,
@@ -180,6 +195,8 @@ impl App {
             last_viewport_height: 20,
             diff_height: 20,
             file_view: FilePanelView::default(),
+            old_pane_area: Rect::default(),
+            new_pane_area: Rect::default(),
             file_scroll: None,
             mouse_pos: (0, 0),
             syntax: true,
@@ -219,6 +236,7 @@ impl App {
     /// for the currently selected file.
     fn reload(&mut self) {
         self.file_scroll = None;
+        self.h_scroll_files = 0;
         match self.repo.changed_files(&self.mode) {
             Ok(files) => {
                 self.files = files;
@@ -241,7 +259,8 @@ impl App {
     fn reload_diff(&mut self) {
         self.diff = SideBySideDiff::default();
         self.scroll = 0;
-        self.h_scroll = 0;
+        self.h_scroll_old = 0;
+        self.h_scroll_new = 0;
         self.hl_generation += 1;
         self.left_hl = Arc::new(Vec::new());
         self.right_hl = Arc::new(Vec::new());
@@ -316,7 +335,9 @@ impl App {
         }
         let selected_path = self.files.get(self.selected).map(|e| e.path.clone());
         let scroll = self.scroll;
-        let h_scroll = self.h_scroll;
+        let h_scroll_old = self.h_scroll_old;
+        let h_scroll_new = self.h_scroll_new;
+        let h_scroll_files = self.h_scroll_files;
         match self.repo.changed_files(&self.mode) {
             Ok(files) => self.files = files,
             // Transient failure (e.g. mid-rebase): keep the current view.
@@ -332,7 +353,9 @@ impl App {
         }
         self.reload_diff();
         self.scroll = scroll;
-        self.h_scroll = h_scroll;
+        self.h_scroll_old = h_scroll_old;
+        self.h_scroll_new = h_scroll_new;
+        self.h_scroll_files = h_scroll_files;
         self.clamp_scroll();
     }
 
@@ -447,6 +470,41 @@ impl App {
     fn over_files(&self) -> bool {
         let (x, y) = self.mouse_pos;
         self.show_files && self.file_view.area.contains(Position::new(x, y))
+    }
+
+    /// Whether the mouse currently hovers the old (left) diff pane.
+    fn over_old(&self) -> bool {
+        let (x, y) = self.mouse_pos;
+        self.old_pane_area.contains(Position::new(x, y))
+    }
+
+    /// Whether the mouse currently hovers the new (right) diff pane.
+    fn over_new(&self) -> bool {
+        let (x, y) = self.mouse_pos;
+        self.new_pane_area.contains(Position::new(x, y))
+    }
+
+    /// Route a horizontal scroll delta to whichever pane sits under the
+    /// mouse; if the mouse hasn't entered any pane yet (e.g. a keyboard
+    /// user who never moved it), scroll both diff panes together.
+    fn h_scroll_by(&mut self, delta: isize) {
+        let apply = |offset: &mut usize, delta: isize| {
+            if delta < 0 {
+                *offset = offset.saturating_sub(delta.unsigned_abs());
+            } else {
+                *offset = offset.saturating_add(delta as usize);
+            }
+        };
+        if self.over_files() {
+            apply(&mut self.h_scroll_files, delta);
+        } else if self.over_old() {
+            apply(&mut self.h_scroll_old, delta);
+        } else if self.over_new() {
+            apply(&mut self.h_scroll_new, delta);
+        } else {
+            apply(&mut self.h_scroll_old, delta);
+            apply(&mut self.h_scroll_new, delta);
+        }
     }
 
     /// Scroll the file panel by `delta` rows, detaching it from the
@@ -573,10 +631,10 @@ impl App {
                 self.scroll = self.row_count().saturating_sub(1);
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                self.h_scroll = self.h_scroll.saturating_sub(4);
+                self.h_scroll_by(-4);
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                self.h_scroll = self.h_scroll.saturating_add(4);
+                self.h_scroll_by(4);
             }
             KeyCode::Char('m') => {
                 self.mode = self.mode.next(&self.base);
@@ -620,10 +678,12 @@ impl App {
             KeyCode::Char('s') => {
                 self.syntax = !self.syntax;
                 let scroll = self.scroll;
-                let h_scroll = self.h_scroll;
+                let h_scroll_old = self.h_scroll_old;
+                let h_scroll_new = self.h_scroll_new;
                 self.reload_diff();
                 self.scroll = scroll;
-                self.h_scroll = h_scroll;
+                self.h_scroll_old = h_scroll_old;
+                self.h_scroll_new = h_scroll_new;
                 self.clamp_scroll();
                 self.set_status(if self.syntax {
                     "syntax highlighting on".to_string()
@@ -666,10 +726,10 @@ impl App {
                 }
             }
             MouseEventKind::ScrollRight => {
-                self.h_scroll = self.h_scroll.saturating_add(4);
+                self.h_scroll_by(4);
             }
             MouseEventKind::ScrollLeft => {
-                self.h_scroll = self.h_scroll.saturating_sub(4);
+                self.h_scroll_by(-4);
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.over_files() {

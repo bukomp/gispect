@@ -74,6 +74,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
+    app.old_pane_area = Rect::default();
+    app.new_pane_area = Rect::default();
+
     let diff_area = if app.show_files {
         let rows = if app.tree_view {
             tree_rows(app)
@@ -185,6 +188,15 @@ fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect, rows: Vec<FileRow<'s
                 span.style = span.style.patch(style);
             }
         }
+        let pairs: Vec<(Style, String)> = spans
+            .into_iter()
+            .map(|span| (span.style, span.content.into_owned()))
+            .collect();
+        let sliced = slice_segments(&pairs, app.h_scroll_files, inner.width as usize);
+        let spans: Vec<Span> = sliced
+            .into_iter()
+            .map(|(style, text)| Span::styled(text, style))
+            .collect();
         lines.push(Line::from(spans));
     }
 
@@ -338,6 +350,11 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
     f.render_widget(block, area);
 
     app.diff_height = inner.height as usize;
+    if is_left {
+        app.old_pane_area = inner;
+    } else {
+        app.new_pane_area = inner;
+    }
 
     if app.diff.rows.is_empty() {
         let msg = Paragraph::new("(no textual diff)")
@@ -442,7 +459,8 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
         };
 
         let content_width = width.saturating_sub(line_no_str.len());
-        let sliced = slice_segments(&segments, app.h_scroll, content_width);
+        let h_scroll = if is_left { app.h_scroll_old } else { app.h_scroll_new };
+        let sliced = slice_segments(&segments, h_scroll, content_width);
 
         let mut spans = vec![Span::styled(
             line_no_str,
@@ -520,7 +538,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("PgDn / PgUp  full-page scroll (pane under mouse)"),
         Line::from("n / N        next / previous change"),
         Line::from("g / G        top / bottom of diff"),
-        Line::from("h/l ← →      scroll horizontally"),
+        Line::from("h/l ← →      h-scroll pane under mouse"),
         Line::from("mouse wheel  scroll pane under cursor"),
         Line::from("mouse click  select file in the file panel"),
         Line::from("m            cycle diff mode"),
@@ -532,7 +550,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("1 / 2        toggle old / new pane"),
         Line::from("b            cycle base branch"),
         Line::from("r            reload"),
-        Line::from("U            apply update"),
+        Line::from("U            apply update & restart"),
         Line::from("? / Esc      toggle this help / quit"),
     ];
 
