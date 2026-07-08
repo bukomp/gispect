@@ -161,8 +161,11 @@ pub struct App {
     pub(crate) file_search: Option<search::FileSearch>,
     /// Committed file-panel path filter (`p`); `None` shows all files.
     pub(crate) path_filter: Option<String>,
-    /// Project-wide search results popup, when open.
-    pub(crate) project_search: Option<search::ProjectSearch>,
+    /// Committed changed-content filter (`S`); `None` shows all files.
+    pub(crate) content_filter: Option<String>,
+    /// Changed-line contents per file for the current mode, parsed from
+    /// one `git diff` and cached while a content filter is in play.
+    changed_lines: Option<HashMap<String, Vec<String>>>,
     /// Set by the repo watcher thread when the repository changed on disk.
     repo_changed: Arc<AtomicBool>,
     trigger_update: bool,
@@ -220,7 +223,8 @@ impl App {
             search_input: None,
             file_search: None,
             path_filter: None,
-            project_search: None,
+            content_filter: None,
+            changed_lines: None,
             repo_changed,
             trigger_update: false,
             awaiting_update_exit: false,
@@ -252,6 +256,12 @@ impl App {
     fn reload(&mut self) {
         self.file_scroll = None;
         self.h_scroll_files = 0;
+        // Changed lines are per-mode and per-repo-state; rebuild only if a
+        // content filter still needs them.
+        self.changed_lines = None;
+        if self.active_content_filter().is_some() {
+            self.ensure_changed_lines();
+        }
         match self.repo.changed_files(&self.mode) {
             Ok(files) => {
                 self.files = files;
@@ -278,15 +288,52 @@ impl App {
         self.path_filter.as_deref()
     }
 
-    /// Whether the file at `idx` passes the active path filter.
+    /// The changed-content filter currently in effect: the live prompt
+    /// text while the user is typing an `S` filter, else the committed
+    /// filter.
+    pub(crate) fn active_content_filter(&self) -> Option<&str> {
+        if let Some(input) = &self.search_input {
+            if input.kind == search::SearchKind::Content {
+                return Some(input.query.as_str());
+            }
+        }
+        self.content_filter.as_deref()
+    }
+
+    /// Whether the file at `idx` passes both active filters (path and
+    /// changed-content); files must pass every filter in play.
     pub(crate) fn passes_filter(&self, idx: usize) -> bool {
-        match self.active_path_filter() {
-            Some(filter) => self
-                .files
-                .get(idx)
-                .map(|e| search::path_matches(&e.path, filter))
+        let Some(entry) = self.files.get(idx) else {
+            return false;
+        };
+        if let Some(filter) = self.active_path_filter() {
+            if !search::path_matches(&entry.path, filter) {
+                return false;
+            }
+        }
+        match self.active_content_filter() {
+            Some(query) if !query.is_empty() => self
+                .changed_lines
+                .as_ref()
+                .and_then(|m| m.get(&entry.path))
+                .map(|lines| search::any_line_matches(lines, query))
                 .unwrap_or(false),
-            None => true,
+            _ => true,
+        }
+    }
+
+    /// Parse changed lines for the current mode from one `git diff`,
+    /// unless already cached; needed while a content filter is in play.
+    fn ensure_changed_lines(&mut self) {
+        if self.changed_lines.is_some() {
+            return;
+        }
+        match self.repo.unified_diff(&self.mode, None) {
+            Ok(diff) => self.changed_lines = Some(search::parse_changed_lines(&diff)),
+            Err(e) => {
+                self.changed_lines = Some(HashMap::new());
+                self.set_status(format!("error: {e}"));
+            }
         }
     }
 
@@ -401,6 +448,10 @@ impl App {
             Ok(files) => self.files = files,
             // Transient failure (e.g. mid-rebase): keep the current view.
             Err(_) => return,
+        }
+        self.changed_lines = None;
+        if self.active_content_filter().is_some() {
+            self.ensure_changed_lines();
         }
         if let Some(path) = selected_path {
             if let Some(idx) = self.files.iter().position(|e| e.path == path) {
@@ -636,12 +687,16 @@ impl App {
         self.set_status(format!("base: {next_base}"));
     }
 
-    /// Open a search prompt of the given kind. The path filter prompt is
+    /// Open a search prompt of the given kind. Filter prompts are
     /// prefilled with the committed filter so it can be edited in place.
     fn open_search(&mut self, kind: search::SearchKind) {
         let query = match kind {
             search::SearchKind::PathFilter => self.path_filter.clone().unwrap_or_default(),
-            _ => String::new(),
+            search::SearchKind::Content => {
+                self.ensure_changed_lines();
+                self.content_filter.clone().unwrap_or_default()
+            }
+            search::SearchKind::File => String::new(),
         };
         self.search_input = Some(search::SearchInput { kind, query });
     }
@@ -651,9 +706,18 @@ impl App {
         match code {
             KeyCode::Esc => {
                 let kind = self.search_input.take().map(|i| i.kind);
-                if kind == Some(search::SearchKind::PathFilter) && self.path_filter.take().is_some()
-                {
-                    self.set_status("file filter cleared".to_string());
+                match kind {
+                    Some(search::SearchKind::PathFilter) => {
+                        if self.path_filter.take().is_some() {
+                            self.set_status("file filter cleared".to_string());
+                        }
+                    }
+                    Some(search::SearchKind::Content) => {
+                        if self.content_filter.take().is_some() {
+                            self.set_status("content filter cleared".to_string());
+                        }
+                    }
+                    _ => {}
                 }
             }
             KeyCode::Enter => self.commit_search(),
@@ -703,18 +767,13 @@ impl App {
                 };
                 self.ensure_selected_visible();
             }
-            search::SearchKind::Project => {
-                if input.query.is_empty() {
-                    return;
-                }
-                let contents = self.repo.all_file_contents(&self.mode, &self.files);
-                let matches = search::search_files(&self.files, &contents, &input.query);
-                self.project_search = Some(search::ProjectSearch {
-                    query: input.query,
-                    matches,
-                    selected: 0,
-                    scroll: 0,
-                });
+            search::SearchKind::Content => {
+                self.content_filter = if input.query.is_empty() {
+                    None
+                } else {
+                    Some(input.query)
+                };
+                self.ensure_selected_visible();
             }
         }
     }
@@ -753,86 +812,10 @@ impl App {
         self.scroll_to_match(next);
     }
 
-    /// Keys while the project-search results popup is open.
-    fn handle_results_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
-        match code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.project_search = None;
-                return;
-            }
-            KeyCode::Enter => {
-                self.open_result();
-                return;
-            }
-            _ => {}
-        }
-        let Some(ps) = &mut self.project_search else {
-            return;
-        };
-        let len = ps.matches.len();
-        if len == 0 {
-            return;
-        }
-        let page = 10;
-        match code {
-            KeyCode::Char('j') | KeyCode::Down => ps.selected = (ps.selected + 1).min(len - 1),
-            KeyCode::Char('k') | KeyCode::Up => ps.selected = ps.selected.saturating_sub(1),
-            KeyCode::PageDown => ps.selected = (ps.selected + page).min(len - 1),
-            KeyCode::PageUp => ps.selected = ps.selected.saturating_sub(page),
-            KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
-                ps.selected = (ps.selected + page).min(len - 1)
-            }
-            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                ps.selected = ps.selected.saturating_sub(page)
-            }
-            KeyCode::Char('g') => ps.selected = 0,
-            KeyCode::Char('G') => ps.selected = len - 1,
-            _ => {}
-        }
-    }
-
-    /// Open the selected project-search result: select its file, scroll
-    /// to the matched line, and carry the query over as an in-file search.
-    fn open_result(&mut self) {
-        let Some(ps) = self.project_search.take() else {
-            return;
-        };
-        let Some(m) = ps.matches.get(ps.selected) else {
-            return;
-        };
-        // Resolve by path: file indices can go stale after an auto-refresh.
-        let Some(idx) = self.files.iter().position(|e| e.path == m.path) else {
-            self.set_status(format!("{} is no longer in the diff", m.path));
-            return;
-        };
-        self.selected = idx;
-        self.file_scroll = None;
-        self.file_search = None;
-        self.reload_diff();
-        let matches = search::search_diff(&self.diff, &ps.query);
-        let current = search::row_for_line(&self.diff, m.line_no, m.in_old)
-            .and_then(|row| matches.iter().position(|rm| rm.row >= row))
-            .unwrap_or(0);
-        let found = !matches.is_empty();
-        self.file_search = Some(search::FileSearch {
-            query: ps.query.clone(),
-            matches,
-            current: 0,
-        });
-        if found {
-            self.scroll_to_match(current);
-        }
-    }
-
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
         // A search prompt swallows everything: keys are text input.
         if self.search_input.is_some() {
             self.handle_search_input(code, modifiers);
-            return;
-        }
-        // The results popup owns navigation keys while open.
-        if self.project_search.is_some() {
-            self.handle_results_key(code, modifiers);
             return;
         }
         // Help overlay swallows most keys except close/quit.
@@ -851,6 +834,8 @@ impl App {
             KeyCode::Esc => {
                 if self.file_search.take().is_some() {
                     self.set_status("search cleared".to_string());
+                } else if self.content_filter.take().is_some() {
+                    self.set_status("content filter cleared".to_string());
                 } else if self.path_filter.take().is_some() {
                     self.set_status("file filter cleared".to_string());
                 } else {
@@ -858,7 +843,7 @@ impl App {
                 }
             }
             KeyCode::Char('/') => self.open_search(search::SearchKind::File),
-            KeyCode::Char('S') => self.open_search(search::SearchKind::Project),
+            KeyCode::Char('S') => self.open_search(search::SearchKind::Content),
             KeyCode::Char('p') => self.open_search(search::SearchKind::PathFilter),
             KeyCode::Char('j') | KeyCode::Down => self.next_file(),
             KeyCode::Char('k') | KeyCode::Up => self.prev_file(),
@@ -990,9 +975,7 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.mouse_pos = (mouse.column, mouse.row);
-        // Overlays swallow mouse input; clicks must not land on the panes
-        // underneath the popup.
-        if self.show_help || self.project_search.is_some() {
+        if self.show_help {
             return;
         }
         match mouse.kind {

@@ -1,18 +1,22 @@
 //! Pure search logic: matching within the current diff, path filtering
-//! for the file panel, and project-wide search across changed files.
-//! Keep this module free of terminal/event concerns so it stays unit-testable.
+//! for the file panel, and content filtering of the file panel by changed
+//! lines. Keep this module free of terminal/event concerns so it stays
+//! unit-testable.
+
+use std::collections::HashMap;
 
 use ratatui::style::Style;
 
-use crate::types::{FileEntry, SideBySideDiff};
+use crate::types::SideBySideDiff;
 
 /// Which search prompt the user is typing into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchKind {
     /// Code search within the currently selected file's diff.
     File,
-    /// Code search across all changed files.
-    Project,
+    /// Filter the file panel to files whose changed lines (added/removed
+    /// lines only) contain the query.
+    Content,
     /// Filter the file panel by file/folder name.
     PathFilter,
 }
@@ -42,31 +46,6 @@ pub struct FileSearch {
     pub matches: Vec<RowMatch>,
     /// Index into `matches` of the current match.
     pub current: usize,
-}
-
-/// One match from a project-wide search across changed files. Matches
-/// carry the file path rather than an index: indices into `App::files`
-/// can go stale while the popup is open (auto-refresh).
-#[derive(Debug, Clone)]
-pub struct ProjectMatch {
-    pub path: String,
-    /// 1-based line number in the searched version of the file.
-    pub line_no: usize,
-    /// True when the old side was searched (deleted files).
-    pub in_old: bool,
-    /// Full content of the matching line, without trailing newline.
-    pub line: String,
-}
-
-/// State of the project-wide search results popup.
-#[derive(Debug, Clone)]
-pub struct ProjectSearch {
-    pub query: String,
-    pub matches: Vec<ProjectMatch>,
-    /// Index into `matches` of the selected result row.
-    pub selected: usize,
-    /// Scroll offset of the results list.
-    pub scroll: usize,
 }
 
 /// Smart-case: a query containing any ASCII uppercase letter matches
@@ -153,50 +132,103 @@ pub fn path_matches(path: &str, filter: &str) -> bool {
     path_lower.contains(&filter_lower)
 }
 
-/// Search `query` (smart-case) across changed files. `contents[i]` is the
-/// `(old, new)` content pair for `files[i]`. The new side is searched;
-/// when the new side is empty and the old is not (deleted files), the old
-/// side is searched with `in_old = true`. Matches are ordered by file,
-/// then line number. Empty query yields no matches.
-pub fn search_files(
-    files: &[FileEntry],
-    contents: &[(String, String)],
-    query: &str,
-) -> Vec<ProjectMatch> {
-    let mut out = Vec::new();
-    if query.is_empty() {
-        return out;
-    }
-    for (file, (old, new)) in files.iter().zip(contents.iter()) {
-        if file.binary {
-            continue;
-        }
-        let (text, in_old) = if new.is_empty() && !old.is_empty() {
-            (old, true)
-        } else {
-            (new, false)
-        };
-        for (i, line) in text.lines().enumerate() {
-            if !match_ranges(line, query).is_empty() {
-                out.push(ProjectMatch {
-                    path: file.path.clone(),
-                    line_no: i + 1,
-                    in_old,
-                    line: line.to_string(),
-                });
+/// Changed-line contents per file, parsed from unified `git diff` text.
+/// Values are the contents of added and removed lines (marker char
+/// stripped); keys are post-change paths (pre-change for deletions).
+///
+/// Known limitation: this does not handle git's quoted-path escaping for
+/// paths containing unusual characters (e.g. spaces, quotes, non-ASCII
+/// under `core.quotepath`); such paths are used as-is, quotes and all.
+pub fn parse_changed_lines(diff: &str) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+
+    let mut pre_path: Option<String> = None;
+    let mut current_key: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut in_section = false;
+
+    // Flush the in-progress section's lines into `out`, keyed by its path.
+    fn flush(
+        out: &mut HashMap<String, Vec<String>>,
+        key: &Option<String>,
+        lines: &mut Vec<String>,
+    ) {
+        if let Some(k) = key {
+            if !lines.is_empty() {
+                out.entry(k.clone()).or_default().append(lines);
             }
         }
+        lines.clear();
     }
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let _ = rest;
+            flush(&mut out, &current_key, &mut current_lines);
+            pre_path = None;
+            current_key = None;
+            in_section = false;
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("--- ") {
+            flush(&mut out, &current_key, &mut current_lines);
+            current_key = None;
+            in_section = false;
+            pre_path = if path == "/dev/null" {
+                None
+            } else {
+                Some(strip_ab_prefix(path))
+            };
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("+++ ") {
+            current_key = if path == "/dev/null" {
+                pre_path.clone()
+            } else {
+                Some(strip_ab_prefix(path))
+            };
+            in_section = true;
+            continue;
+        }
+
+        if !in_section {
+            continue;
+        }
+
+        if line.starts_with('\\') {
+            // "\ No newline at end of file" - not a changed line.
+            continue;
+        }
+
+        if let Some(content) = line.strip_prefix('+') {
+            current_lines.push(content.to_string());
+        } else if let Some(content) = line.strip_prefix('-') {
+            current_lines.push(content.to_string());
+        }
+        // Any other line (context, hunk headers, etc.) is ignored.
+    }
+
+    flush(&mut out, &current_key, &mut current_lines);
     out
 }
 
-/// Aligned row index whose new-side (or old-side when `in_old`) cell has
-/// line number `line_no`, if any.
-pub fn row_for_line(diff: &SideBySideDiff, line_no: usize, in_old: bool) -> Option<usize> {
-    diff.rows.iter().position(|row| {
-        let cell = if in_old { &row.left } else { &row.right };
-        cell.as_ref().map(|c| c.line_no) == Some(line_no)
-    })
+/// Strip a leading `a/` or `b/` prefix from a unified-diff header path.
+fn strip_ab_prefix(path: &str) -> String {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// Whether any of `lines` contains `query` (smart-case). An empty query
+/// matches everything, mirroring `path_matches`.
+pub fn any_line_matches(lines: &[String], query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    lines.iter().any(|line| !match_ranges(line, query).is_empty())
 }
 
 /// Overlay `style` (via `Style::patch`) on every occurrence of `query`
@@ -279,23 +311,13 @@ pub fn highlight_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DiffRow, FileStatus, LineCell, RowKind};
+    use crate::types::{DiffRow, LineCell, RowKind};
     use ratatui::style::Color;
 
     fn cell(line_no: usize, content: &str) -> LineCell {
         LineCell {
             line_no,
             content: content.to_string(),
-        }
-    }
-
-    fn file_entry(path: &str, binary: bool) -> FileEntry {
-        FileEntry {
-            path: path.to_string(),
-            status: FileStatus::Modified,
-            additions: 0,
-            deletions: 0,
-            binary,
         }
     }
 
@@ -439,58 +461,136 @@ mod tests {
         assert!(path_matches("anything.rs", ""));
     }
 
-    // -- search_files --
+    // -- parse_changed_lines --
+
+    const MULTI_FILE_DIFF: &str = "\
+diff --git a/src/lib.rs b/src/lib.rs
+index 1234567..89abcde 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,7 +10,8 @@ fn foo() {
+ context line
+-    old code
++    new code
++    x += 1;
+diff --git a/new.rs b/new.rs
+new file mode 100644
+index 0000000..abc1234
+--- /dev/null
++++ b/new.rs
+@@ -0,0 +1,2 @@
++fn added() {}
++// new file
+diff --git a/gone.rs b/gone.rs
+deleted file mode 100644
+index abc1234..0000000
+--- a/gone.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-fn removed() {}
+-// bye
+diff --git a/img.png b/img.png
+index abc1234..def5678 100644
+Binary files a/img.png and b/img.png differ
+diff --git a/nonl.rs b/nonl.rs
+index abc1234..def5678 100644
+--- a/nonl.rs
++++ b/nonl.rs
+@@ -1 +1 @@
+-old
+\\ No newline at end of file
++new
+\\ No newline at end of file
+";
 
     #[test]
-    fn search_files_searches_new_side_and_skips_binary() {
-        let files = vec![
-            file_entry("a.rs", false),
-            file_entry("b.bin", true),
-            file_entry("c.rs", false),
-        ];
-        let contents = vec![
-            ("old a\n".to_string(), "needle here\nsecond needle\n".to_string()),
-            ("needle".to_string(), "needle".to_string()),
-            ("".to_string(), "no match\n".to_string()),
-        ];
-        let matches = search_files(&files, &contents, "needle");
-        assert_eq!(matches.len(), 2);
-        assert_eq!(matches[0].path, "a.rs");
-        assert_eq!(matches[0].line_no, 1);
-        assert!(!matches[0].in_old);
-        assert_eq!(matches[0].line, "needle here");
-        assert_eq!(matches[1].path, "a.rs");
-        assert_eq!(matches[1].line_no, 2);
-        assert_eq!(matches[1].line, "second needle");
+    fn parse_changed_lines_modified_file_strips_only_marker_char() {
+        let parsed = parse_changed_lines(MULTI_FILE_DIFF);
+        let lib = parsed.get("src/lib.rs").expect("src/lib.rs should have changed lines");
+        assert_eq!(
+            lib,
+            &vec![
+                "    old code".to_string(),
+                "    new code".to_string(),
+                "    x += 1;".to_string(),
+            ]
+        );
     }
 
     #[test]
-    fn search_files_deleted_file_falls_back_to_old_side() {
-        let files = vec![file_entry("deleted.rs", false)];
-        let contents = vec![("needle here\n".to_string(), "".to_string())];
-        let matches = search_files(&files, &contents, "needle");
-        assert_eq!(matches.len(), 1);
-        assert!(matches[0].in_old);
-        assert_eq!(matches[0].line_no, 1);
-        assert_eq!(matches[0].line, "needle here");
+    fn parse_changed_lines_added_file_keyed_by_new_path() {
+        let parsed = parse_changed_lines(MULTI_FILE_DIFF);
+        let new_file = parsed.get("new.rs").expect("new.rs should have changed lines");
+        assert_eq!(
+            new_file,
+            &vec!["fn added() {}".to_string(), "// new file".to_string()]
+        );
     }
 
     #[test]
-    fn search_files_empty_query_yields_none() {
-        let files = vec![file_entry("a.rs", false)];
-        let contents = vec![("".to_string(), "needle\n".to_string())];
-        assert!(search_files(&files, &contents, "").is_empty());
+    fn parse_changed_lines_deleted_file_keyed_by_pre_change_path() {
+        let parsed = parse_changed_lines(MULTI_FILE_DIFF);
+        let gone = parsed.get("gone.rs").expect("gone.rs should have changed lines");
+        assert_eq!(
+            gone,
+            &vec!["fn removed() {}".to_string(), "// bye".to_string()]
+        );
     }
 
-    // -- row_for_line --
+    #[test]
+    fn parse_changed_lines_binary_file_produces_no_entry() {
+        let parsed = parse_changed_lines(MULTI_FILE_DIFF);
+        assert!(parsed.get("img.png").is_none());
+    }
 
     #[test]
-    fn row_for_line_finds_old_and_new_sides() {
-        let diff = make_diff();
-        assert_eq!(row_for_line(&diff, 1, false), Some(1)); // right side line 1
-        assert_eq!(row_for_line(&diff, 1, true), Some(0)); // left side line 1
-        assert_eq!(row_for_line(&diff, 2, false), Some(2));
-        assert_eq!(row_for_line(&diff, 99, false), None);
+    fn parse_changed_lines_headers_and_hunk_markers_not_captured() {
+        let parsed = parse_changed_lines(MULTI_FILE_DIFF);
+        let lib = parsed.get("src/lib.rs").unwrap();
+        // Neither the "--- a/..." / "+++ b/..." header lines nor the
+        // "@@ ... @@" hunk header should show up as changed-line content.
+        assert!(!lib.iter().any(|l| l.contains("@@")));
+        assert!(!lib.iter().any(|l| l.starts_with("- a/") || l.starts_with("+ b/")));
+        assert!(!lib.contains(&"context line".to_string()));
+    }
+
+    #[test]
+    fn parse_changed_lines_skips_no_newline_marker() {
+        let parsed = parse_changed_lines(MULTI_FILE_DIFF);
+        let nonl = parsed.get("nonl.rs").expect("nonl.rs should have changed lines");
+        assert_eq!(nonl, &vec!["old".to_string(), "new".to_string()]);
+    }
+
+    #[test]
+    fn parse_changed_lines_empty_diff_yields_empty_map() {
+        assert!(parse_changed_lines("").is_empty());
+    }
+
+    // -- any_line_matches --
+
+    #[test]
+    fn any_line_matches_smart_case() {
+        let lines = vec!["Hello World".to_string(), "other".to_string()];
+        assert!(any_line_matches(&lines, "hello"));
+        assert!(any_line_matches(&lines, "Hello"));
+        assert!(!any_line_matches(&lines, "Goodbye"));
+        // Smart-case: uppercase query is case-sensitive and should not
+        // match a lowercase-only occurrence.
+        assert!(!any_line_matches(&lines, "OTHER"));
+    }
+
+    #[test]
+    fn any_line_matches_empty_query_matches_everything() {
+        let lines = vec!["anything".to_string()];
+        assert!(any_line_matches(&lines, ""));
+        let empty: Vec<String> = Vec::new();
+        assert!(any_line_matches(&empty, ""));
+    }
+
+    #[test]
+    fn any_line_matches_no_lines_no_match() {
+        let empty: Vec<String> = Vec::new();
+        assert!(!any_line_matches(&empty, "needle"));
     }
 
     // -- highlight_segments --

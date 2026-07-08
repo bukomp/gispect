@@ -53,7 +53,7 @@ Cycle with `m`:
 | `b` | cycle base branch |
 | `r` | reload |
 | `/` | search code in the current file's diff |
-| `S` | search code across all changed files |
+| `S` | filter files by changed-line content (live) |
 | `p` | filter the file panel by file/folder name |
 | `U` | apply available update and restart into the new version |
 | `?` | help overlay |
@@ -64,10 +64,11 @@ Cycle with `m`:
 - `/` searches within the currently selected file's diff. While a search is
   active, `n` / `N` jump to the next / previous match instead of the next /
   previous change hunk, and `Esc` clears the search.
-- `S` searches across every changed file and opens a results popup listing
-  `path:line: content` for each match. `j` / `k` move the selection, `Enter`
-  opens the selected match — jumping to that file and line with the query
-  still highlighted — and `Esc` closes the popup.
+- `S` live-filters the changed-files panel to files whose changed lines
+  (added or removed lines only — never untouched parts of a file) contain the
+  typed text, updating as you type. `Enter` keeps the filter applied; `Esc`
+  clears it. It stacks with the `p` name filter: when both are set, a file
+  must pass both to stay in the panel.
 - `p` filters the file panel to files/folders whose path contains the typed
   text (case-insensitive substring match), updating live as you type. `Enter`
   keeps the filter applied; `Esc` clears it.

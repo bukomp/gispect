@@ -29,8 +29,6 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_footer(f, app, chunks[2]);
     }
 
-    crate::search_ui::draw_project_results(f, app, area);
-
     if app.show_help {
         draw_help(f, area);
     }
@@ -73,7 +71,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  n/N change  / search  S search-all  p filter  m mode  c compact  s syntax  f files  t tree  F wide  1/2 old/new  b base  r reload  U update  ? help  q quit",
+            " j/k files  J/K scroll  n/N change  / search  S content  p filter  m mode  c compact  s syntax  f files  t tree  F wide  1/2 old/new  b base  r reload  U update  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
@@ -142,15 +140,17 @@ fn file_panel_width(rows: &[FileRow], wide: bool, total_width: u16) -> u16 {
 }
 
 fn draw_file_list(f: &mut Frame, app: &mut App, area: Rect, rows: Vec<FileRow<'static>>) {
-    // With a path filter active, show visible/total so hidden files are
+    // With any filter active, show visible/total so hidden files are
     // accounted for at a glance.
-    let count = match app.active_path_filter() {
-        Some(_) => format!(
+    let filtered = app.active_path_filter().is_some() || app.active_content_filter().is_some();
+    let count = if filtered {
+        format!(
             "{}/{}",
             rows.iter().filter(|r| r.file_idx.is_some()).count(),
             app.files.len()
-        ),
-        None => app.files.len().to_string(),
+        )
+    } else {
+        app.files.len().to_string()
     };
     let title = format!(
         "Files ({}) [f] {} [t] {} [F]",
@@ -583,9 +583,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("n / N        next / previous change (or match)"),
         Line::from("g / G        top / bottom of diff"),
         Line::from("/            search in current file"),
-        Line::from("S            search all changed files"),
+        Line::from("S            filter files by changed text"),
         Line::from("p            filter file panel by name"),
-        Line::from("Esc          clear search / filter, then quit"),
+        Line::from("Esc          clear search / filters, then quit"),
         Line::from("h/l ← →      h-scroll pane under mouse"),
         Line::from("mouse wheel  scroll pane under cursor"),
         Line::from("mouse click  select file in the file panel"),
