@@ -318,6 +318,7 @@ mod tests {
         LineCell {
             line_no,
             content: content.to_string(),
+            changed: Vec::new(),
         }
     }
 

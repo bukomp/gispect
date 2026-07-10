@@ -85,6 +85,11 @@ pub struct LineCell {
     pub line_no: usize,
     /// Line content without trailing newline.
     pub content: String,
+    /// Intra-line changed spans: 0-based char (not byte) ranges
+    /// `[start, end)` into `content`. Sorted, non-overlapping, adjacent
+    /// ranges merged. Empty when the whole line should be treated as
+    /// changed (or the row isn't Modified).
+    pub changed: Vec<(usize, usize)>,
 }
 
 /// Classification of an aligned diff row.

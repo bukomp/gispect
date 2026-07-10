@@ -488,6 +488,27 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
             ),
         };
 
+        // Emphasize intra-line changed spans on Modified rows with a
+        // stronger background tint than the whole-line role tint above.
+        // Ranges are char offsets into the original (unexpanded) content,
+        // so they must be shifted for tabs expanded in step 2.
+        let segments = match (row.kind, cell) {
+            (RowKind::Modified, Some(c)) if !c.changed.is_empty() => {
+                let emphasis_bg = if is_left {
+                    Color::Rgb(110, 36, 36)
+                } else {
+                    Color::Rgb(30, 95, 45)
+                };
+                let adjusted: Vec<(usize, usize)> = c
+                    .changed
+                    .iter()
+                    .map(|r| expand_tab_range(&c.content, *r))
+                    .collect();
+                overlay_ranges(&segments, &adjusted, Style::default().bg(emphasis_bg))
+            }
+            _ => segments,
+        };
+
         // Tint search matches on top of whatever styling the row already
         // has; the current (n/N cursor) match gets a brighter tint.
         let segments = match &app.file_search {
@@ -550,6 +571,67 @@ fn slice_segments(segments: &[(Style, String)], skip: usize, take: usize) -> Vec
     result
 }
 
+/// Shift a char range from original-content coordinates into
+/// tab-expanded coordinates, given tabs are rendered as 4 spaces. Each
+/// tab before a position adds 3 extra chars ahead of it.
+fn expand_tab_range(content: &str, (start, end): (usize, usize)) -> (usize, usize) {
+    let expand = |pos: usize| -> usize {
+        let tabs_before = content.chars().take(pos).filter(|&c| c == '\t').count();
+        pos + 3 * tabs_before
+    };
+    (expand(start), expand(end))
+}
+
+/// Patch `patch` over the given char ranges of a styled-segment line,
+/// splitting segments at range boundaries. Ranges are char-indexed into
+/// the concatenated segment text, sorted and non-overlapping. Kept in
+/// the same spirit as `slice_segments`: char-boundary-safe, never
+/// byte-slices.
+fn overlay_ranges(
+    segments: &[(Style, String)],
+    ranges: &[(usize, usize)],
+    patch: Style,
+) -> Vec<(Style, String)> {
+    if ranges.is_empty() {
+        return segments.to_vec();
+    }
+
+    let mut result = Vec::new();
+    let mut pos = 0usize; // char offset into the concatenated text so far
+    let mut range_idx = 0usize;
+
+    for (style, text) in segments {
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            // Advance past ranges that ended before the current position.
+            while range_idx < ranges.len() && ranges[range_idx].1 <= pos {
+                range_idx += 1;
+            }
+            let in_range = range_idx < ranges.len()
+                && ranges[range_idx].0 <= pos
+                && pos < ranges[range_idx].1;
+            let run_style = if in_range { style.patch(patch) } else { *style };
+            // Find how far this run extends within the current segment,
+            // stopping at the next range boundary or segment end.
+            let run_end = if in_range {
+                (ranges[range_idx].1 - pos).min(chars.len() - i)
+            } else if range_idx < ranges.len() && ranges[range_idx].0 > pos {
+                (ranges[range_idx].0 - pos).min(chars.len() - i)
+            } else {
+                chars.len() - i
+            };
+            let run_end = run_end.max(1); // always make progress
+            let piece: String = chars[i..i + run_end].iter().collect();
+            result.push((run_style, piece));
+            i += run_end;
+            pos += run_end;
+        }
+    }
+
+    result
+}
+
 fn center_vertically(area: Rect, content_height: u16) -> Rect {
     if area.height <= content_height {
         return area;
@@ -605,4 +687,103 @@ fn draw_help(f: &mut Frame, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title("Help");
     let para = Paragraph::new(text).block(block);
     f.render_widget(para, popup);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(text: &str) -> Vec<(Style, String)> {
+        vec![(Style::default(), text.to_string())]
+    }
+
+    fn text_of(segments: &[(Style, String)]) -> String {
+        segments.iter().map(|(_, t)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn overlay_range_inside_one_segment_splits_into_three() {
+        let segments = plain("hello");
+        let patch = Style::default().bg(Color::Red);
+        let out = overlay_ranges(&segments, &[(1, 3)], patch);
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], (Style::default(), "h".to_string()));
+        assert_eq!(out[1], (Style::default().patch(patch), "el".to_string()));
+        assert_eq!(out[2], (Style::default(), "lo".to_string()));
+        assert_eq!(text_of(&out), "hello");
+    }
+
+    #[test]
+    fn overlay_range_spans_two_segments() {
+        let s1 = Style::default().fg(Color::Blue);
+        let s2 = Style::default().fg(Color::Green);
+        let segments = vec![(s1, "foo".to_string()), (s2, "bar".to_string())];
+        let patch = Style::default().bg(Color::Red);
+        // "foo bar" chars: f0 o1 o2 b3 a4 r5 -> range (2,5) covers o,b,a.
+        let out = overlay_ranges(&segments, &[(2, 5)], patch);
+
+        assert_eq!(text_of(&out), "foobar");
+        assert_eq!(out[0], (s1, "fo".to_string()));
+        assert_eq!(out[1], (s1.patch(patch), "o".to_string()));
+        assert_eq!(out[2], (s2.patch(patch), "ba".to_string()));
+        assert_eq!(out[3], (s2, "r".to_string()));
+    }
+
+    #[test]
+    fn overlay_multiple_ranges() {
+        let segments = plain("abcdefgh");
+        let patch = Style::default().bg(Color::Red);
+        let out = overlay_ranges(&segments, &[(1, 2), (4, 6)], patch);
+
+        assert_eq!(text_of(&out), "abcdefgh");
+        let patched: String = out
+            .iter()
+            .filter(|(s, _)| *s == Style::default().patch(patch))
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(patched, "bef");
+    }
+
+    #[test]
+    fn overlay_multi_byte_chars_split_at_char_positions_without_panicking() {
+        // "héllo": h(0) é(1) l(2) l(3) o(4) — é is multi-byte in UTF-8.
+        let segments = plain("héllo");
+        let patch = Style::default().bg(Color::Red);
+        let out = overlay_ranges(&segments, &[(1, 3)], patch);
+
+        assert_eq!(text_of(&out), "héllo");
+        assert_eq!(out[0].1, "h");
+        assert_eq!(out[1].1, "él");
+        assert_eq!(out[2].1, "lo");
+    }
+
+    #[test]
+    fn overlay_empty_ranges_returns_input_unchanged() {
+        let segments = vec![
+            (Style::default().fg(Color::Blue), "foo".to_string()),
+            (Style::default().fg(Color::Green), "bar".to_string()),
+        ];
+        let out = overlay_ranges(&segments, &[], Style::default().bg(Color::Red));
+        assert_eq!(out, segments);
+    }
+
+    #[test]
+    fn expand_tab_range_shifts_by_tabs_before_position() {
+        // Original chars: a(0) \t(1) b(2) \t(3) c(4).
+        // Expanded: 'a' + 4 spaces + 'b' + 4 spaces + 'c', so 'b' moves
+        // from original index 2 to expanded index 5.
+        assert_eq!(expand_tab_range("a\tb\tc", (2, 3)), (5, 6));
+    }
+
+    #[test]
+    fn expand_tab_range_no_tabs_is_identity() {
+        assert_eq!(expand_tab_range("hello", (1, 3)), (1, 3));
+    }
+
+    #[test]
+    fn expand_tab_range_multiple_tabs_before_start() {
+        // "\t\tx": two tabs then x at original index 2 -> expanded index 8.
+        assert_eq!(expand_tab_range("\t\tx", (2, 3)), (8, 9));
+    }
 }
