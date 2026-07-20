@@ -75,7 +75,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  n/N change  / search  S content  p filter  m mode  c compact  s syntax  f files  t tree  F wide  1/2 old/new  b base  r reload  U update  C config  ? help  q quit",
+            " j/k files  J/K scroll  n/N change  / search  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
