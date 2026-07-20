@@ -32,6 +32,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_help {
         draw_help(f, area);
     }
+
+    if app.config_modal.is_some() {
+        draw_config_modal(f, app, area);
+    }
 }
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -71,7 +75,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  n/N change  / search  S content  p filter  m mode  c compact  s syntax  f files  t tree  F wide  1/2 old/new  b base  r reload  U update  ? help  q quit",
+            " j/k files  J/K scroll  n/N change  / search  S content  p filter  m mode  c compact  s syntax  f files  t tree  F wide  1/2 old/new  b base  r reload  U update  C config  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
@@ -647,7 +651,7 @@ fn center_vertically(area: Rect, content_height: u16) -> Rect {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let width = 52u16.min(area.width);
-    let height = 30u16.min(area.height);
+    let height = 31u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect { x, y, width, height };
@@ -674,6 +678,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("m            cycle diff mode"),
         Line::from("c            toggle compact view (hide filler)"),
         Line::from("s            toggle syntax highlighting"),
+        Line::from("C            open config (startup defaults)"),
         Line::from("f            toggle file list panel"),
         Line::from("t            toggle file tree / list view"),
         Line::from("F            expand file panel to fit names"),
@@ -686,6 +691,43 @@ fn draw_help(f: &mut Frame, area: Rect) {
 
     let block = Block::default().borders(Borders::ALL).title("Help");
     let para = Paragraph::new(text).block(block);
+    f.render_widget(para, popup);
+}
+
+fn draw_config_modal(f: &mut Frame, app: &App, area: Rect) {
+    let Some(modal) = app.config_modal.as_ref() else {
+        return;
+    };
+
+    // 8 setting rows + blank + hint line, plus the border.
+    let width = 54u16.min(area.width);
+    let height = 12u16.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect { x, y, width, height };
+
+    f.render_widget(Clear, popup);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(crate::config::ConfigField::ALL.len() + 2);
+    for (i, field) in crate::config::ConfigField::ALL.into_iter().enumerate() {
+        let text = format!(" {:<20} {} ", field.label(), modal.draft.value_label(field));
+        let style = if i == modal.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " space toggle · u use current · s save · esc cancel",
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" config — startup defaults ");
+    let para = Paragraph::new(lines).block(block);
     f.render_widget(para, popup);
 }
 

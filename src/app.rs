@@ -19,6 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 
+use crate::config;
 use crate::git::GitRepo;
 use crate::highlight::{self, HlLines};
 use crate::search;
@@ -170,10 +171,15 @@ pub struct App {
     repo_changed: Arc<AtomicBool>,
     trigger_update: bool,
     awaiting_update_exit: bool,
+    /// The last-saved startup config; overwritten when the config modal
+    /// saves a new draft.
+    pub(crate) config: config::Config,
+    /// Open config modal, if any; `Some` swallows most key handling.
+    pub(crate) config_modal: Option<config::ConfigModal>,
 }
 
 impl App {
-    fn new(repo: GitRepo, mode: DiffMode) -> Self {
+    fn new(repo: GitRepo, mode: DiffMode, config: config::Config) -> Self {
         let base = match &mode {
             DiffMode::BranchToBase { base } => base.clone(),
             _ => repo.default_base(),
@@ -183,6 +189,18 @@ impl App {
         let (hl_jobs, hl_results) = spawn_highlight_worker();
         let repo_changed = Arc::new(AtomicBool::new(false));
         spawn_repo_watcher(repo.clone(), repo_changed.clone());
+        let compact = config.compact;
+        let syntax = config.syntax;
+        let show_files = config.show_files;
+        let tree_view = config.tree_view;
+        let wide_files = config.wide_files;
+        // Defend against a hand-edited config file with both panes off:
+        // the app invariant is at least one pane always visible.
+        let (show_old, show_new) = if !config.show_old && !config.show_new {
+            (true, true)
+        } else {
+            (config.show_old, config.show_new)
+        };
         App {
             repo,
             mode,
@@ -196,12 +214,12 @@ impl App {
             h_scroll_new: 0,
             h_scroll_files: 0,
             show_help: false,
-            compact: false,
-            show_files: true,
-            tree_view: false,
-            wide_files: false,
-            show_old: true,
-            show_new: true,
+            compact,
+            show_files,
+            tree_view,
+            wide_files,
+            show_old,
+            show_new,
             status: None,
             update_state: Arc::new(Mutex::new(UpdateState::Checking)),
             base_choices,
@@ -213,7 +231,7 @@ impl App {
             new_pane_area: Rect::default(),
             file_scroll: None,
             mouse_pos: (0, 0),
-            syntax: true,
+            syntax,
             left_hl: Arc::new(Vec::new()),
             right_hl: Arc::new(Vec::new()),
             hl_jobs,
@@ -228,6 +246,8 @@ impl App {
             repo_changed,
             trigger_update: false,
             awaiting_update_exit: false,
+            config,
+            config_modal: None,
         }
     }
 
@@ -818,6 +838,11 @@ impl App {
             self.handle_search_input(code, modifiers);
             return;
         }
+        // Config modal swallows all keys while open.
+        if self.config_modal.is_some() {
+            self.handle_config_key(code);
+            return;
+        }
         // Help overlay swallows most keys except close/quit.
         if self.show_help {
             match code {
@@ -969,8 +994,116 @@ impl App {
                 self.trigger_update = true;
             }
             KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Char('C') => {
+                self.config_modal = Some(config::ConfigModal::new(self.config.clone()));
+            }
             _ => {}
         }
+    }
+
+    /// Route a key press into the open config modal: navigate, toggle the
+    /// selected field, seed the draft from the live session, save, or
+    /// close without saving.
+    fn handle_config_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(modal) = self.config_modal.as_mut() {
+                    modal.next();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(modal) = self.config_modal.as_mut() {
+                    modal.prev();
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                if let Some(modal) = self.config_modal.as_mut() {
+                    let field = modal.field();
+                    modal.draft.toggle(field, true);
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                if let Some(modal) = self.config_modal.as_mut() {
+                    let field = modal.field();
+                    modal.draft.toggle(field, false);
+                }
+            }
+            KeyCode::Char('u') => {
+                // Seed the draft from the live session; read the seven
+                // live values first so the borrow of config_modal below
+                // doesn't overlap a borrow of the rest of self.
+                let live_mode = config::ModeKind::from_diff_mode(&self.mode);
+                let live_compact = self.compact;
+                let live_syntax = self.syntax;
+                let live_show_files = self.show_files;
+                let live_tree_view = self.tree_view;
+                let live_wide_files = self.wide_files;
+                let live_show_old = self.show_old;
+                let live_show_new = self.show_new;
+                if let Some(modal) = self.config_modal.as_mut() {
+                    modal.draft.default_mode = live_mode;
+                    modal.draft.compact = live_compact;
+                    modal.draft.syntax = live_syntax;
+                    modal.draft.show_files = live_show_files;
+                    modal.draft.tree_view = live_tree_view;
+                    modal.draft.wide_files = live_wide_files;
+                    modal.draft.show_old = live_show_old;
+                    modal.draft.show_new = live_show_new;
+                }
+            }
+            KeyCode::Char('s') => {
+                let Some(draft) = self.config_modal.as_ref().map(|m| m.draft.clone()) else {
+                    return;
+                };
+                if !draft.show_old && !draft.show_new {
+                    self.set_status("at least one pane must stay visible");
+                    return;
+                }
+                match draft.save() {
+                    Ok(()) => {
+                        self.config = draft.clone();
+                        self.config_modal = None;
+                        self.apply_config(&draft);
+                        self.set_status("config saved");
+                    }
+                    Err(e) => {
+                        self.set_status(format!("config save failed: {e}"));
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.config_modal = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply a saved config draft to the live session: update the view
+    /// flags and, if the mode or syntax setting changed, reload the diff
+    /// so the panes reflect it immediately.
+    fn apply_config(&mut self, draft: &config::Config) {
+        let syntax_changed = self.syntax != draft.syntax;
+        let mode_changed = draft.default_mode != config::ModeKind::from_diff_mode(&self.mode);
+        self.compact = draft.compact;
+        self.syntax = draft.syntax;
+        self.show_files = draft.show_files;
+        self.tree_view = draft.tree_view;
+        self.wide_files = draft.wide_files;
+        self.show_old = draft.show_old;
+        self.show_new = draft.show_new;
+        if mode_changed {
+            self.mode = draft.default_mode.to_diff_mode(&self.base);
+            self.reload();
+        } else if syntax_changed {
+            let scroll = self.scroll;
+            let h_scroll_old = self.h_scroll_old;
+            let h_scroll_new = self.h_scroll_new;
+            self.reload_diff();
+            self.scroll = scroll;
+            self.h_scroll_old = h_scroll_old;
+            self.h_scroll_new = h_scroll_new;
+        }
+        self.clamp_scroll();
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -1020,8 +1153,8 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(repo: GitRepo, mode: DiffMode) -> Result<()> {
-    let mut app = App::new(repo, mode);
+pub fn run(repo: GitRepo, mode: DiffMode, config: config::Config) -> Result<()> {
+    let mut app = App::new(repo, mode, config);
     app.reload();
 
     spawn_update_check(app.update_state.clone());

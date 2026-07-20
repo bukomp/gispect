@@ -55,9 +55,48 @@ Cycle with `m`:
 | `/` | search code in the current file's diff |
 | `S` | filter files by changed-line content (live) |
 | `p` | filter the file panel by file/folder name |
+| `C` | open config (startup defaults) |
 | `U` | apply available update and restart into the new version |
 | `?` | help overlay |
 | `q` / `Esc` | quit |
+
+## Configuration
+
+Pressing `C` opens the config modal, which lists startup defaults. Editing and
+saving writes them to disk and also applies them to the current session, so
+gispect opens with your preferred setup every time.
+
+| Key | Action |
+|---|---|
+| `j` / `k`, `↓` / `↑` | move between settings |
+| `Space`, `Enter`, `l`, `→` | toggle / cycle forward |
+| `h`, `←` | cycle backward (matters for the default-mode setting, which cycles through modes) |
+| `u` | copy the current session's settings into the form |
+| `s` | save and close (persist to disk and apply to the session) |
+| `Esc`, `q` | cancel without saving |
+
+Settings are stored in `$XDG_CONFIG_HOME/gispect/config.json`, falling back to
+`~/.config/gispect/config.json`, as JSON:
+
+| Field | Meaning | Default |
+|---|---|---|
+| `default_mode` | startup diff mode: `"branch-to-base"` \| `"working-tree"` \| `"staged"` \| `"unstaged"` | `"branch-to-base"` (branch vs base) |
+| `compact` | compact view | off (`false`) |
+| `syntax` | syntax highlighting | on (`true`) |
+| `show_files` | file panel | on (`true`) |
+| `tree_view` | tree view | off (`false`) |
+| `wide_files` | wide file panel | off (`false`) |
+| `show_old` | old pane | on (`true`) |
+| `show_new` | new pane | on (`true`) |
+
+Missing fields fall back to defaults; a missing or invalid config file just
+means defaults. Saving from the modal writes the full file.
+
+With no config file, gispect behaves exactly as today. With one, it opens in
+the configured mode and view settings. Passing `--base <branch>` on the CLI
+still forces branch vs base mode with that base — the explicit flag wins over
+the configured default mode. The base branch itself is intentionally not
+persisted (it is repo-specific).
 
 ## Search
 

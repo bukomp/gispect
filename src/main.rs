@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod diff;
 mod git;
 mod highlight;
@@ -49,11 +50,22 @@ fn main() -> Result<()> {
         .repo
         .unwrap_or_else(|| std::env::current_dir().expect("cannot resolve cwd"));
     let repo = GitRepo::discover(&path)?;
+    let base_flag = cli.base.is_some();
     let base = cli.base.unwrap_or_else(|| repo.default_base());
+    let config = config::Config::load();
 
     match cli.command {
         Some(Command::Mcp) => mcp::run(repo),
         Some(Command::Update) => unreachable!(),
-        None => app::run(repo, DiffMode::BranchToBase { base }),
+        None => {
+            // An explicit --base always forces branch-vs-base, overriding
+            // the configured default mode.
+            let mode = if base_flag {
+                DiffMode::BranchToBase { base }
+            } else {
+                config.default_mode.to_diff_mode(&base)
+            };
+            app::run(repo, mode, config)
+        }
     }
 }
