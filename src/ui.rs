@@ -421,9 +421,24 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
     for (row_idx, row) in &rows[start..end] {
         let cell = if is_left { &row.left } else { &row.right };
 
-        let (line_no_str, segments): (String, Vec<(Style, String)>) = match cell {
+        let (line_no_str, marker, segments): (String, Span, Vec<(Style, String)>) = match cell {
             Some(c) => {
                 let line_no_str = format!("{:>4} ", c.line_no);
+
+                // Per-line status letter: A = added, M = modified,
+                // D = deleted; blank for context/filler.
+                let marker = match (row.kind, is_left) {
+                    (RowKind::Added, false) => {
+                        Span::styled("A ", Style::default().fg(Color::Green))
+                    }
+                    (RowKind::Removed, true) => {
+                        Span::styled("D ", Style::default().fg(Color::Red))
+                    }
+                    (RowKind::Modified, _) => {
+                        Span::styled("M ", Style::default().fg(Color::Yellow))
+                    }
+                    _ => Span::raw("  "),
+                };
 
                 // Base segments: syntax-highlighted spans when enabled and
                 // available, otherwise a single unstyled segment.
@@ -484,10 +499,11 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
                     vec![(style, base_segments.into_iter().map(|(_, t)| t).collect())]
                 };
 
-                (line_no_str, segments)
+                (line_no_str, marker, segments)
             }
             None => (
                 "     ".to_string(),
+                Span::raw("  "),
                 vec![(Style::default().add_modifier(Modifier::DIM), String::new())],
             ),
         };
@@ -527,14 +543,14 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
             None => segments,
         };
 
-        let content_width = width.saturating_sub(line_no_str.len());
+        let content_width = width.saturating_sub(line_no_str.len() + marker.content.len());
         let h_scroll = if is_left { app.h_scroll_old } else { app.h_scroll_new };
         let sliced = slice_segments(&segments, h_scroll, content_width);
 
-        let mut spans = vec![Span::styled(
-            line_no_str,
-            Style::default().add_modifier(Modifier::DIM),
-        )];
+        let mut spans = vec![
+            Span::styled(line_no_str, Style::default().add_modifier(Modifier::DIM)),
+            marker,
+        ];
         spans.extend(sliced.into_iter().map(|(style, text)| Span::styled(text, style)));
 
         lines.push(Line::from(spans));
