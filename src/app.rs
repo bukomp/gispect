@@ -176,8 +176,11 @@ pub struct App {
     trigger_update: bool,
     awaiting_update_exit: bool,
     /// The last-saved startup config; overwritten when the config modal
-    /// saves a new draft.
+    /// saves a new draft or `persist_settings` saves a live change.
     pub(crate) config: config::Config,
+    /// Mode to open in next time. Only an explicit switch changes it, so a
+    /// `--base` launch doesn't overwrite the saved default on its own.
+    startup_mode: config::ModeKind,
     /// Open config modal, if any; `Some` swallows most key handling.
     pub(crate) config_modal: Option<config::ConfigModal>,
     /// PR list state, kept across visits so results stay cached.
@@ -285,6 +288,7 @@ impl App {
             repo_changed,
             trigger_update: false,
             awaiting_update_exit: false,
+            startup_mode: config.default_mode,
             config,
             config_modal: None,
             pr_list: None,
@@ -1075,6 +1079,7 @@ impl App {
             }
             KeyCode::Char('m') => {
                 self.mode = self.mode.next(&self.base);
+                self.startup_mode = config::ModeKind::from_diff_mode(&self.mode);
                 let label = self.mode.label();
                 self.reload();
                 self.set_status(label);
@@ -1230,6 +1235,7 @@ impl App {
     fn apply_config(&mut self, draft: &config::Config) {
         let syntax_changed = self.syntax != draft.syntax;
         let mode_changed = draft.default_mode != config::ModeKind::from_diff_mode(&self.mode);
+        self.startup_mode = draft.default_mode;
         self.compact = draft.compact;
         self.syntax = draft.syntax;
         self.show_files = draft.show_files;
@@ -1250,6 +1256,32 @@ impl App {
             self.h_scroll_new = h_scroll_new;
         }
         self.clamp_scroll();
+    }
+
+    /// Save the live view settings to disk when they differ from the
+    /// last-saved config, so the next launch opens the same way. The
+    /// default mode comes from `startup_mode`, not the live mode.
+    fn persist_settings(&mut self) {
+        let live = config::Config {
+            default_mode: self.startup_mode,
+            compact: self.compact,
+            syntax: self.syntax,
+            show_files: self.show_files,
+            tree_view: self.tree_view,
+            wide_files: self.wide_files,
+            show_old: self.show_old,
+            show_new: self.show_new,
+        };
+        if live == self.config {
+            return;
+        }
+        // Record it even if the write fails, so a broken config dir
+        // reports once instead of retrying on every event.
+        let result = live.save();
+        self.config = live;
+        if let Err(e) = result {
+            self.set_status(format!("settings save failed: {e}"));
+        }
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -2202,6 +2234,7 @@ fn event_loop(
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
                 _ => {}
             }
+            app.persist_settings();
         }
 
         if app.trigger_update {

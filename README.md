@@ -91,9 +91,12 @@ Cycle with `m`:
 
 ## Configuration
 
+View settings are saved automatically: toggling them with their keys (`t`,
+`f`, `F`, `1`, `2`, `c`, `s`) or switching mode with `m` writes the change to
+disk, so gispect opens the same way next time.
+
 Pressing `C` opens the config modal, which lists startup defaults. Editing and
-saving writes them to disk and also applies them to the current session, so
-gispect opens with your preferred setup every time.
+saving writes them to disk and also applies them to the current session.
 
 | Key | Action |
 |---|---|
@@ -119,13 +122,13 @@ Settings are stored in `$XDG_CONFIG_HOME/gispect/config.json`, falling back to
 | `show_new` | new pane | on (`true`) |
 
 Missing fields fall back to defaults; a missing or invalid config file just
-means defaults. Saving from the modal writes the full file.
+means defaults. Every save writes the full file.
 
 With no config file, gispect behaves exactly as today. With one, it opens in
 the configured mode and view settings. Passing `--base <branch>` on the CLI
 still forces branch vs base mode with that base — the explicit flag wins over
-the configured default mode. The base branch itself is intentionally not
-persisted (it is repo-specific).
+the configured default mode, and does not change the saved default. The base
+branch itself is intentionally not persisted (it is repo-specific).
 
 ## Search
 
