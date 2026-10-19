@@ -176,6 +176,8 @@ fn draw_rows(f: &mut Frame, list: &mut PrList, area: Rect) {
 /// Widths of the right-hand columns, sized to the widest value in the
 /// whole list so they line up (and don't jitter while scrolling).
 struct Columns {
+    /// `owner/repo#number`, so titles start in one column.
+    repo: usize,
     author: usize,
     additions: usize,
     deletions: usize,
@@ -186,11 +188,16 @@ impl Columns {
         let max =
             |f: &dyn Fn(&PrSummary) -> usize| rows.iter().map(|(_, pr)| f(pr)).max().unwrap_or(0);
         Columns {
+            repo: max(&|pr| repo_label(pr).len()).min(48),
             author: max(&|pr| pr.author.chars().count()).min(24),
             additions: max(&|pr| pr.additions.to_string().len()),
             deletions: max(&|pr| pr.deletions.to_string().len()),
         }
     }
+}
+
+fn repo_label(pr: &PrSummary) -> String {
+    format!("{}#{}", pr.repo, pr.number)
 }
 
 fn pr_row(
@@ -216,7 +223,11 @@ fn pr_row(
     let left = vec![
         Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color)),
         Span::styled(
-            format!("{}#{} ", pr.repo, pr.number),
+            format!(
+                "{:<w$} ",
+                truncate(&repo_label(pr), cols.repo),
+                w = cols.repo
+            ),
             Style::default().fg(Color::Cyan),
         ),
     ];
