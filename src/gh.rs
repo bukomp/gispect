@@ -57,13 +57,22 @@ impl Account {
     /// resolves another host can't send the token there.
     fn gh(&self) -> Command {
         let mut cmd = Command::new("gh");
-        let token_var = if self.host == "github.com" {
+        // gh reads GH_TOKEN for github.com, localhost and GHE.com
+        // tenancies (`*.ghe.com`), GH_ENTERPRISE_TOKEN for other hosts.
+        let token_var = if self.host == "github.com"
+            || self.host == "localhost"
+            || self.host.ends_with(".ghe.com")
+        {
             "GH_TOKEN"
         } else {
             "GH_ENTERPRISE_TOKEN"
         };
+        // Clear every token variable gh would fall back to, so a token in
+        // the user's shell can't make a request run as another account.
         cmd.env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
             .env_remove("GH_ENTERPRISE_TOKEN")
+            .env_remove("GITHUB_ENTERPRISE_TOKEN")
             .env(token_var, &self.token)
             .env("GH_HOST", &self.host)
             .env("GH_PROMPT_DISABLED", "1")
@@ -81,6 +90,28 @@ impl Account {
             .args(args)
             .output()
             .context("failed to run gh — is the GitHub CLI installed?")?;
+        if !output.status.success() {
+            return Err(api_error(&output));
+        }
+        Ok(output.stdout)
+    }
+
+    /// `POST` `payload` as the JSON body of `endpoint`, returning stdout.
+    /// The body goes through stdin, never the command line.
+    fn post_json(&self, endpoint: &str, payload: &Value) -> Result<Vec<u8>> {
+        let mut child = self
+            .gh()
+            .args(["api", "--hostname", &self.host, "-X", "POST", endpoint])
+            .args(["--input", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to run gh — is the GitHub CLI installed?")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(payload.to_string().as_bytes())?;
+        }
+        let output = child.wait_with_output()?;
         if !output.status.success() {
             return Err(api_error(&output));
         }
@@ -606,24 +637,8 @@ pub fn submit_review(
 ) -> Result<()> {
     ensure_repo(repo)?;
     ensure_sha(commit_id)?;
-    let payload = review_payload(commit_id, event, body, comments).to_string();
-    let mut child = account
-        .gh()
-        .args(["api", "--hostname", &account.host, "-X", "POST"])
-        .arg(format!("repos/{repo}/pulls/{number}/reviews"))
-        .args(["--input", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to run gh — is the GitHub CLI installed?")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(payload.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(api_error(&output));
-    }
+    let payload = review_payload(commit_id, event, body, comments);
+    account.post_json(&format!("repos/{repo}/pulls/{number}/reviews"), &payload)?;
     Ok(())
 }
 
@@ -643,6 +658,321 @@ pub fn open_in_browser(account: &Account, url: &str) -> Result<()> {
         bail!("gh pr view --web failed");
     }
     Ok(())
+}
+
+/// A repository as seen by one account.
+#[derive(Debug, Clone)]
+pub struct RepoAccess {
+    /// The account may push, which dispatching and re-running need.
+    pub can_push: bool,
+    pub default_branch: String,
+}
+
+/// Whether `account` can see `repo`, and what it may do there.
+pub fn repo_access(account: &Account, repo: &str) -> Result<RepoAccess> {
+    ensure_repo(repo)?;
+    #[derive(Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        default_branch: String,
+        #[serde(default)]
+        permissions: Option<Perms>,
+    }
+    #[derive(Deserialize)]
+    struct Perms {
+        #[serde(default)]
+        push: bool,
+    }
+    let raw: Raw = serde_json::from_slice(&account.api(&[&format!("repos/{repo}")])?)
+        .context("unexpected repository response from GitHub")?;
+    Ok(RepoAccess {
+        can_push: raw.permissions.is_some_and(|p| p.push),
+        default_branch: sanitize_line(&raw.default_branch),
+    })
+}
+
+/// One GitHub Actions workflow of a repository.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Workflow {
+    pub id: u64,
+    pub name: String,
+    /// File path, e.g. `.github/workflows/ci.yml`. Workflows GitHub
+    /// manages itself (code scanning, Pages, …) have other paths.
+    pub path: String,
+    /// `active`, `disabled_manually`, `disabled_inactivity`, …
+    pub state: String,
+}
+
+impl Workflow {
+    pub fn is_active(&self) -> bool {
+        self.state == "active"
+    }
+
+    /// Whether this is a file in the repository (vs a GitHub-managed
+    /// workflow), so it can have a `workflow_dispatch` trigger.
+    pub fn is_file(&self) -> bool {
+        self.path.starts_with(".github/workflows/") && valid_path(&self.path)
+    }
+}
+
+/// Every workflow of `repo`, sorted by name.
+pub fn workflows(account: &Account, repo: &str) -> Result<Vec<Workflow>> {
+    ensure_repo(repo)?;
+    #[derive(Deserialize)]
+    struct Page {
+        #[serde(default)]
+        workflows: Vec<Workflow>,
+    }
+    let pages: Vec<Page> = serde_json::from_slice(&account.api(&[
+        "--paginate",
+        "--slurp",
+        &format!("repos/{repo}/actions/workflows?per_page=100"),
+    ])?)
+    .context("unexpected workflow list response from GitHub")?;
+    let mut workflows: Vec<Workflow> = pages
+        .into_iter()
+        .flat_map(|p| p.workflows)
+        .map(|mut w| {
+            w.name = sanitize_line(&w.name);
+            w.path = sanitize_line(&w.path);
+            w.state = sanitize_line(&w.state);
+            w
+        })
+        .collect();
+    workflows.sort_by_key(|w| w.name.to_lowercase());
+    Ok(workflows)
+}
+
+/// One run of a workflow.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct WorkflowRun {
+    pub id: u64,
+    pub workflow_id: u64,
+    pub run_number: u64,
+    /// Commit message, PR title or `run-name`.
+    pub display_title: String,
+    /// `queued`, `in_progress`, `completed`, `waiting`, `requested`,
+    /// `pending`.
+    pub status: String,
+    /// Set once completed: `success`, `failure`, `cancelled`, …
+    pub conclusion: Option<String>,
+    pub head_branch: Option<String>,
+    pub event: String,
+    /// ISO-8601 UTC timestamp.
+    pub created_at: String,
+    #[serde(deserialize_with = "login_of")]
+    pub actor: String,
+}
+
+impl WorkflowRun {
+    pub fn is_active(&self) -> bool {
+        self.status != "completed"
+    }
+}
+
+/// The 100 most recent runs of `repo`, newest first.
+pub fn workflow_runs(account: &Account, repo: &str) -> Result<Vec<WorkflowRun>> {
+    ensure_repo(repo)?;
+    #[derive(Deserialize)]
+    struct Page {
+        #[serde(default)]
+        workflow_runs: Vec<WorkflowRun>,
+    }
+    let page: Page = serde_json::from_slice(
+        &account.api(&[&format!("repos/{repo}/actions/runs?per_page=100")])?,
+    )
+    .context("unexpected run list response from GitHub")?;
+    Ok(page
+        .workflow_runs
+        .into_iter()
+        .map(|mut r| {
+            for field in [
+                &mut r.display_title,
+                &mut r.status,
+                &mut r.event,
+                &mut r.created_at,
+                &mut r.actor,
+            ] {
+                *field = sanitize_line(field);
+            }
+            r.conclusion = r.conclusion.as_deref().map(sanitize_line);
+            r.head_branch = r.head_branch.as_deref().map(sanitize_line);
+            r
+        })
+        .collect())
+}
+
+/// Contents of a workflow file on the default branch, for workflows the
+/// local checkout doesn't have.
+pub fn workflow_file(account: &Account, repo: &str, path: &str) -> Result<String> {
+    ensure_repo(repo)?;
+    if !path.starts_with(".github/workflows/") || !valid_path(path) {
+        bail!("refusing unexpected workflow path {path:?}");
+    }
+    let endpoint = format!("repos/{repo}/contents/{}", encode_path(path));
+    let raw = account.api(&["-H", "Accept: application/vnd.github.raw", &endpoint])?;
+    Ok(String::from_utf8_lossy(&raw).into_owned())
+}
+
+/// Start a `workflow_dispatch` run of workflow `id` on `git_ref` with
+/// the given input values.
+pub fn dispatch_workflow(
+    account: &Account,
+    repo: &str,
+    id: u64,
+    git_ref: &str,
+    inputs: &[(String, String)],
+) -> Result<()> {
+    ensure_repo(repo)?;
+    if !valid_ref(git_ref) {
+        bail!("invalid branch or tag name {git_ref:?}");
+    }
+    let inputs: serde_json::Map<String, Value> = inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+        .collect();
+    let payload = json!({ "ref": git_ref, "inputs": inputs });
+    account.post_json(
+        &format!("repos/{repo}/actions/workflows/{id}/dispatches"),
+        &payload,
+    )?;
+    Ok(())
+}
+
+/// What to do with an existing run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunAction {
+    Rerun,
+    RerunFailed,
+    Cancel,
+}
+
+impl RunAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            RunAction::Rerun => "re-run",
+            RunAction::RerunFailed => "re-run of failed jobs",
+            RunAction::Cancel => "cancel",
+        }
+    }
+
+    fn endpoint(self) -> &'static str {
+        match self {
+            RunAction::Rerun => "rerun",
+            RunAction::RerunFailed => "rerun-failed-jobs",
+            RunAction::Cancel => "cancel",
+        }
+    }
+}
+
+/// Re-run or cancel run `run_id`.
+pub fn run_action(account: &Account, repo: &str, run_id: u64, action: RunAction) -> Result<()> {
+    ensure_repo(repo)?;
+    account.api(&[
+        "-X",
+        "POST",
+        &format!("repos/{repo}/actions/runs/{run_id}/{}", action.endpoint()),
+    ])?;
+    Ok(())
+}
+
+/// Open a workflow (`run: None`) or one of its runs in the browser.
+pub fn open_actions_page(
+    account: &Account,
+    repo: &str,
+    workflow: u64,
+    run: Option<u64>,
+) -> Result<()> {
+    ensure_repo(repo)?;
+    let target = format!("{}/{repo}", account.host);
+    let mut cmd = account.gh();
+    match run {
+        Some(run) => cmd.args(["run", "view", &run.to_string()]),
+        None => cmd.args(["workflow", "view", &workflow.to_string()]),
+    };
+    let status = cmd
+        .args(["--repo", &target, "--web"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to run gh — is the GitHub CLI installed?")?;
+    if !status.success() {
+        bail!("gh could not open the page");
+    }
+    Ok(())
+}
+
+/// A branch or tag name GitHub could accept (roughly
+/// `git check-ref-format`).
+pub fn valid_ref(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains("//")
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
+}
+
+/// `(host, owner/name)` of a GitHub-style remote URL: HTTPS,
+/// `ssh://` or scp-like `git@host:owner/name.git`. The host may be an
+/// SSH config alias; see [`ssh_hostname`].
+pub fn parse_remote(url: &str) -> Option<(String, String)> {
+    let url = url.trim();
+    let (host, path) = if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("ssh://"))
+        .or_else(|| url.strip_prefix("git+ssh://"))
+    {
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority.rsplit('@').next()?;
+        // Drop a port (`ssh://git@host:22/…`).
+        (host.split(':').next()?, path)
+    } else if !url.contains("://") {
+        let (authority, path) = url.split_once(':')?;
+        (authority.rsplit('@').next()?, path)
+    } else {
+        return None;
+    };
+    let repo = path.trim_end_matches('/');
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    (valid_host(host) && valid_repo(repo)).then(|| (host.to_ascii_lowercase(), repo.to_string()))
+}
+
+fn valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with(['-', '.'])
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
+/// The real hostname behind an SSH config alias (`Host work-gh` →
+/// `HostName github.com`), from `ssh -G`.
+pub fn ssh_hostname(alias: &str) -> Option<String> {
+    if !valid_host(alias) {
+        return None;
+    }
+    let output = Command::new("ssh")
+        .args(["-G", "--", alias])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("hostname "))
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| valid_host(h))
 }
 
 /// `owner/name` with only the characters GitHub allows in each part.
@@ -792,6 +1122,55 @@ mod tests {
         assert_eq!(sanitize_text("a\x1b[2Jb\r\nc\td"), "a\u{FFFD}[2Jb\nc\td");
         assert_eq!(sanitize_text("x\u{202E}y\u{9b}"), "x\u{FFFD}y\u{FFFD}");
         assert_eq!(sanitize_line("t1\nt2\tz"), "t1 t2 z");
+    }
+
+    #[test]
+    fn remote_urls_parse() {
+        let gh = |h: &str, r: &str| Some((h.to_string(), r.to_string()));
+        assert_eq!(
+            parse_remote("https://github.com/o/r.git"),
+            gh("github.com", "o/r")
+        );
+        assert_eq!(
+            parse_remote("https://tok@GitHub.com/o/r/"),
+            gh("github.com", "o/r")
+        );
+        assert_eq!(
+            parse_remote("git@priv-github.com:o/r.git"),
+            gh("priv-github.com", "o/r")
+        );
+        assert_eq!(
+            parse_remote("ssh://git@ghe.corp:2222/o/r"),
+            gh("ghe.corp", "o/r")
+        );
+        assert_eq!(parse_remote("/srv/git/r.git"), None);
+        assert_eq!(parse_remote("file:///srv/o/r"), None);
+        assert_eq!(parse_remote("git@-oProxy:o/r"), None);
+        assert_eq!(parse_remote("https://github.com/o/r/x"), None);
+    }
+
+    #[test]
+    fn ref_names_validate() {
+        assert!(valid_ref("main"));
+        assert!(valid_ref("feat/x-1.2"));
+        assert!(valid_ref("v1.0.0"));
+        assert!(!valid_ref(""));
+        assert!(!valid_ref("a b"));
+        assert!(!valid_ref("a..b"));
+        assert!(!valid_ref("-x"));
+        assert!(!valid_ref("x.lock"));
+        assert!(!valid_ref("a:b"));
+    }
+
+    #[test]
+    fn runs_parse_with_null_fields() {
+        let body = r#"{"id":5,"workflow_id":2,"run_number":9,"display_title":"t","status":"completed",
+            "conclusion":null,"head_branch":null,"event":"push","created_at":"2026-10-15T11:37:21Z",
+            "actor":null,"extra":1}"#;
+        let run: WorkflowRun = serde_json::from_str(body).unwrap();
+        assert_eq!(run.id, 5);
+        assert_eq!(run.actor, "ghost");
+        assert!(run.conclusion.is_none() && !run.is_active());
     }
 
     #[test]

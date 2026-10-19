@@ -1,3 +1,5 @@
+mod actions;
+mod actions_ui;
 mod app;
 mod config;
 mod diff;
@@ -12,6 +14,7 @@ mod search_ui;
 mod types;
 mod ui;
 mod update;
+mod workflow;
 mod workspace;
 
 use anyhow::Result;
@@ -45,6 +48,9 @@ enum Command {
     /// Open the pull request view (review requests and your PRs across
     /// every logged-in gh account). Works outside a git repository.
     Prs,
+    /// Open the GitHub Actions view: run workflows and watch runs of
+    /// this repository, or of every repository under a parent folder.
+    Actions,
 }
 
 fn main() -> Result<()> {
@@ -57,7 +63,12 @@ fn main() -> Result<()> {
     let path = cli
         .repo
         .unwrap_or_else(|| std::env::current_dir().expect("cannot resolve cwd"));
-    let open_prs = matches!(cli.command, Some(Command::Prs));
+    let start = match cli.command {
+        Some(Command::Prs) => app::StartView::Prs,
+        Some(Command::Actions) => app::StartView::Actions,
+        _ => app::StartView::Diff,
+    };
+    let open_prs = start == app::StartView::Prs;
     // The PR view doesn't need a local repository; everything else does.
     let repo = match Workspace::discover(&path) {
         Ok(ws) => Some(ws),
@@ -83,7 +94,7 @@ fn main() -> Result<()> {
             } else {
                 config.default_mode.to_diff_mode(&base)
             };
-            app::run(repo, mode, config, open_prs)
+            app::run(repo, mode, config, start)
         }
     }
 }

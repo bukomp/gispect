@@ -45,7 +45,6 @@ impl GitRepo {
     }
 
     /// The repository's working-tree root.
-    #[allow(dead_code)]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -81,6 +80,25 @@ impl GitRepo {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "HEAD".to_string())
+    }
+
+    /// URLs of the repository's remotes, `origin` first.
+    pub fn remote_urls(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .git_opt(&["remote"])
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|n| !n.is_empty() && !n.starts_with('-'))
+            .map(str::to_string)
+            .collect();
+        names.sort_by_key(|n| n != "origin");
+        names
+            .iter()
+            .filter_map(|n| self.git_opt(&["remote", "get-url", "--", n]))
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .collect()
     }
 
     /// First of "main"/"master" that exists as a ref, else the current

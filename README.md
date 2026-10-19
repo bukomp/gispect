@@ -27,6 +27,7 @@ gispect --repo ~/src    # inspect every repository directly under a folder
 gispect update          # check upstream for new commits and reinstall
 gispect mcp             # run as an MCP server over stdio
 gispect prs             # pull request view: review requests and your PRs
+gispect actions         # GitHub Actions: run workflows, watch runs
 ```
 
 ## Multiple repositories
@@ -54,6 +55,7 @@ used, as before.
   gets the files from GitHub.
 - `gispect mcp` serves the same combined view: paths in tool input and output
   have the repository prefix.
+- The actions view (`a`) shows a tree with one collapsible row per repository.
 
 ## Diff modes
 
@@ -86,6 +88,7 @@ Cycle with `m`:
 | `C` | open config (startup defaults) |
 | `U` | apply available update and restart into the new version |
 | `P` | pull request view (PRs across logged-in gh accounts) |
+| `a` | GitHub Actions view (run workflows of this repository or of every repository in the folder) |
 | `?` | help overlay |
 | `q` / `Esc` | quit |
 
@@ -231,6 +234,93 @@ Text from GitHub (titles, descriptions, file names, file contents) has
 terminal control characters and Unicode bidi overrides replaced with `�` before
 display, so a PR can't inject escape sequences and "Trojan Source" characters
 stay visible.
+
+## GitHub Actions
+
+`a` (or `gispect actions`) opens the Actions view. It needs a local repository
+and the GitHub CLI (`gh`) logged in. It handles tokens per account like the PR
+view, so the active `gh` account is never switched.
+
+Each repository is matched to GitHub through its remotes (`origin` first).
+HTTPS, `ssh://` and `git@host:owner/name` URLs work. SSH config aliases (for
+example `git@work-gh:owner/name`) are resolved with `ssh -G`, and
+`ssh.github.com` (SSH over port 443) counts as github.com.
+
+For each repository, gispect picks a logged-in account on that host that can
+push (needed to run or re-run workflows), else the first that can read it. The
+account named like the repository owner is tried first. A private repository
+that no logged-in account can see shows "not found" with a hint to log in with
+`gh auth login`.
+
+Opened inside a repository, the view lists that repository's workflows at the
+top level. Opened in a parent folder, it shows one collapsed row per
+repository: the GitHub name, local branch, one status glyph per workflow (its
+latest run), the workflow count and how many runs are active. Repositories
+without a GitHub remote or without workflows say so.
+
+Workflow rows show the latest run glyph, the name, `▶ run` when it can be run
+by hand, `disabled` when it is disabled on GitHub, and the latest run's number,
+branch and age. GitHub-managed workflows (Copilot, Dependabot, Pages) are
+dimmed. Expanding a workflow lists its latest 8 runs (from the repository's
+100 most recent runs) with event, branch, actor and age.
+
+Glyphs: `✓` success, `✗` failure / timed out, `⊘` cancelled / skipped, `●` in
+progress, `◌` queued / waiting, `!` action required, `·` no recent runs.
+
+| Key | Action |
+|---|---|
+| `j` / `k`, `↓` / `↑` | select |
+| `g` / `G` | top / bottom |
+| `PgDn` / `PgUp` | page |
+| `Space` | expand / collapse |
+| `l` / `→` | expand |
+| `h` / `←` | collapse, or go to the parent row |
+| `e` | expand / collapse all (repositories, or every workflow's runs in a single repository) |
+| `Enter` | run the workflow (form), expand a repository, or open a run in the browser |
+| `R` | re-run the selected run (on a workflow row: its latest run) |
+| `F` | re-run failed jobs |
+| `X` | cancel an active run (press twice to confirm) |
+| `o` | open the workflow or run in the browser |
+| `/` | filter repositories and workflows by name or path (smart-case, live; `Enter` keeps, `Esc` clears) |
+| `r` | refresh everything |
+| `Esc` | back (clears the filter first) |
+| `q` | quit |
+
+Mouse: wheel moves the selection, click selects.
+
+### Running a workflow
+
+`Enter` on a workflow with a `workflow_dispatch` trigger opens a form. The ref
+defaults to the checked-out branch (the default branch when HEAD is detached)
+and must exist on GitHub. Inputs come from the workflow file in the local
+checkout, or from the default branch on GitHub when the file is not checked
+out. Input types: text, number, boolean (`[x]`), choice (`‹ value ›`) and
+environment. Required inputs are marked `*`. Empty optional inputs are left
+out, so the workflow's default applies. A warning shows when the account may
+not have write access.
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift-Tab`, `↓` / `↑` | move between fields |
+| type | edit text |
+| `Backspace` | delete |
+| `Ctrl-U` | clear the field |
+| `Space`, `←` / `→` | toggle booleans, cycle choices |
+| `Enter`, `Ctrl-S` | run |
+| `Esc` | cancel |
+
+On failure the form stays open with GitHub's error.
+
+After a run is started, re-run or cancelled, the run list refreshes every 3
+seconds for 45 seconds, so the new state shows up. While any run of a
+repository is queued or in progress, it refreshes every 8 seconds. Otherwise
+press `r`.
+
+Workflow files are parsed with node, nesting-depth and 1 MB size limits, so a
+file with nested YAML aliases or deep nesting can't exhaust memory or the
+stack. Text from GitHub and from
+workflow files has control characters replaced before display, as in the PR
+view.
 
 ## MCP server
 

@@ -19,6 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 
+use crate::actions;
 use crate::config;
 use crate::gh::{self, Side};
 use crate::workspace::Workspace;
@@ -210,6 +211,10 @@ pub struct App {
     pub(crate) pr_info_scroll: Option<u16>,
     /// Set by a first quit/leave with unsent drafts; a second one confirms.
     discard_armed: bool,
+    /// GitHub Actions view state, kept across visits.
+    pub(crate) actions: Option<actions::ActionsView>,
+    /// Whether the actions screen is showing.
+    pub(crate) actions_open: bool,
 }
 
 impl App {
@@ -307,6 +312,8 @@ impl App {
             review_modal: None,
             pr_info_scroll: None,
             discard_armed: false,
+            actions: None,
+            actions_open: false,
         }
     }
 
@@ -958,6 +965,10 @@ impl App {
         // Any key other than a repeated quit/leave disarms the draft
         // discard confirmation.
         let armed = std::mem::take(&mut self.discard_armed);
+        if self.actions_open {
+            self.handle_actions_key(code, modifiers, armed);
+            return;
+        }
         if self.pr_list_open {
             self.handle_pr_list_key(code, modifiers, armed);
             self.sync_preload();
@@ -1018,6 +1029,7 @@ impl App {
                 }
             }
             KeyCode::Char('P') => self.open_pr_list(),
+            KeyCode::Char('a') => self.open_actions(),
             KeyCode::Char('/') => self.open_search(search::SearchKind::File),
             KeyCode::Char('S') => self.open_search(search::SearchKind::Content),
             KeyCode::Char('p') => self.open_search(search::SearchKind::PathFilter),
@@ -1290,6 +1302,12 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.mouse_pos = (mouse.column, mouse.row);
+        if self.actions_open {
+            if let Some(view) = self.actions.as_mut() {
+                view.handle_mouse(mouse);
+            }
+            return;
+        }
         if self.pr_list_open {
             self.handle_pr_list_mouse(mouse);
             return;
@@ -1339,6 +1357,48 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// GitHub Actions view.
+impl App {
+    /// Show the actions screen, loading workflows the first time.
+    pub(crate) fn open_actions(&mut self) {
+        let Some(workspace) = &self.workspace else {
+            self.set_status("actions need a local repository");
+            return;
+        };
+        if self.actions.is_none() {
+            self.actions = Some(actions::ActionsView::new(workspace));
+        }
+        self.actions_open = true;
+    }
+
+    fn handle_actions_key(&mut self, code: KeyCode, modifiers: KeyModifiers, armed: bool) {
+        let Some(view) = self.actions.as_mut() else {
+            self.actions_open = false;
+            return;
+        };
+        match view.handle_key(code, modifiers) {
+            actions::KeyOutcome::Done(Some(status)) => self.set_status(status),
+            actions::KeyOutcome::Done(None) => {}
+            actions::KeyOutcome::Back => self.actions_open = false,
+            actions::KeyOutcome::Quit => self.request_quit(armed),
+        }
+    }
+
+    /// Apply finished actions jobs and start due run refreshes.
+    pub(crate) fn poll_actions(&mut self) {
+        let Some(view) = self.actions.as_mut() else {
+            return;
+        };
+        let messages = view.poll();
+        if self.actions_open {
+            view.tick();
+        }
+        if let Some(last) = messages.into_iter().last() {
+            self.set_status(last);
         }
     }
 }
@@ -2197,17 +2257,27 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Run the TUI. `open_prs` starts on the pull request list.
+/// Screen the TUI opens on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartView {
+    Diff,
+    Prs,
+    Actions,
+}
+
+/// Run the TUI, starting on `start`.
 pub fn run(
     workspace: Option<Workspace>,
     mode: DiffMode,
     config: config::Config,
-    open_prs: bool,
+    start: StartView,
 ) -> Result<()> {
     let mut app = App::new(workspace, mode, config);
     app.reload();
-    if open_prs || app.workspace.is_none() {
+    if start == StartView::Prs || app.workspace.is_none() {
         app.open_pr_list();
+    } else if start == StartView::Actions {
+        app.open_actions();
     }
 
     spawn_update_check(app.update_state.clone());
@@ -2319,6 +2389,7 @@ fn event_loop(
         app.apply_highlight_results();
         app.poll_auto_refresh();
         app.poll_pr_events();
+        app.poll_actions();
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {

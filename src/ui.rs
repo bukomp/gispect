@@ -12,6 +12,10 @@ use crate::types::{FileStatus, RowKind};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    if app.actions_open {
+        crate::actions_ui::draw_actions(f, app, area);
+        return;
+    }
     if app.pr_list_open {
         crate::pr_ui::draw_pr_list(f, app, area);
         return;
@@ -101,7 +105,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  n/N change  / search  P PRs  ? help  q quit",
+            " j/k files  J/K scroll  n/N change  / search  P PRs  a actions  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
@@ -750,6 +754,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from("r            reload"),
         Line::from("U            apply update & restart"),
         Line::from("P            pull requests (gh accounts)"),
+        Line::from("a            GitHub Actions: run workflows"),
         Line::from("? / Esc      toggle this help / quit"),
     ];
     if app.pr.is_some() {

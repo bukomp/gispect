@@ -218,6 +218,26 @@ impl Workspace {
         hasher.finish()
     }
 
+    /// Every repository with its display name (the folder name, also for
+    /// a single repository) and checked-out branch, in workspace order.
+    pub fn repos(&self) -> Vec<(String, GitRepo, String)> {
+        self.members
+            .iter()
+            .map(|m| {
+                let name = if m.name.is_empty() {
+                    m.repo
+                        .root()
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                } else {
+                    m.name.clone()
+                };
+                (name, m.repo.clone(), m.branch.clone())
+            })
+            .collect()
+    }
+
     /// Local clone to read PR commits from: the repository itself, or in
     /// multi-repo mode the one whose folder matches the PR repository's
     /// name (`owner/name`). Commits it lacks are fetched from GitHub.

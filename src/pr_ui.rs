@@ -12,7 +12,7 @@ use crate::app::App;
 use crate::gh::{PrSummary, ReviewEvent, Side};
 use crate::pr::{self, Load, PrList, PrTab, PreloadStatus, Preloader};
 
-const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+pub(crate) const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
 /// The full-screen PR list: status line, tab bar, rows, footer.
 pub fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
@@ -572,7 +572,7 @@ fn char_width(ch: char) -> usize {
 }
 
 /// Cut `text` to at most `max` display columns, ending in `…` when cut.
-fn truncate(text: &str, max: usize) -> String {
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     if Span::raw(text).width() <= max {
         return text.to_string();
     }
@@ -593,7 +593,7 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 /// A `width`×`height` rect centered in `area` (clamped to fit).
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
+pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
     Rect {
@@ -605,7 +605,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// Split off the bottom row of `area` (for a hint line).
-fn split_last_line(area: Rect) -> [Rect; 2] {
+pub(crate) fn split_last_line(area: Rect) -> [Rect; 2] {
     let body_height = area.height.saturating_sub(1);
     [
         Rect {
