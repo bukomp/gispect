@@ -34,6 +34,15 @@ impl std::fmt::Debug for Account {
 }
 
 impl Account {
+    #[cfg(test)]
+    pub fn for_test(login: &str) -> Account {
+        Account {
+            host: "github.com".into(),
+            login: login.into(),
+            token: String::new(),
+        }
+    }
+
     /// Short label: the login, plus the host when it isn't github.com.
     pub fn label(&self) -> String {
         if self.host == "github.com" {

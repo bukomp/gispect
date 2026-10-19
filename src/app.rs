@@ -194,6 +194,8 @@ pub struct App {
     pr_generation: u64,
     pr_tx: mpsc::Sender<PrEvent>,
     pr_rx: mpsc::Receiver<PrEvent>,
+    /// Fetches the PRs of the open list tab ahead of time.
+    pub(crate) preloader: pr::Preloader,
     /// Selected local file, restored when leaving a PR review.
     local_selected_path: Option<String>,
     /// The selected PR file's contents are still being fetched.
@@ -295,6 +297,7 @@ impl App {
             pr_list_open: false,
             pr: None,
             pr_generation: 0,
+            preloader: pr::Preloader::new(pr_tx.clone()),
             pr_tx,
             pr_rx,
             local_selected_path: None,
@@ -957,6 +960,7 @@ impl App {
         let armed = std::mem::take(&mut self.discard_armed);
         if self.pr_list_open {
             self.handle_pr_list_key(code, modifiers, armed);
+            self.sync_preload();
             return;
         }
         // PR modals take text input, so they come before everything else.
@@ -1367,6 +1371,31 @@ impl App {
             }
         }
         list.clamp_selection();
+        self.sync_preload();
+    }
+
+    /// Point the preloader at the PRs the list currently shows, top row
+    /// first.
+    fn sync_preload(&mut self) {
+        let Some(list) = self.pr_list.as_ref() else {
+            return;
+        };
+        let accounts = list.account_list();
+        let targets = list
+            .rows()
+            .into_iter()
+            .filter_map(|(a, pr)| {
+                Some(pr::PreloadTarget {
+                    account: accounts.get(a)?.clone(),
+                    summary: pr.clone(),
+                    local: self
+                        .workspace
+                        .as_ref()
+                        .and_then(|ws| ws.local_for(&pr.repo)),
+                })
+            })
+            .collect();
+        self.preloader.retarget(targets);
     }
 
     /// Drain finished background `gh` jobs into the list and session.
@@ -1390,6 +1419,50 @@ impl App {
                         },
                     );
                     list.clamp_selection();
+                    self.sync_preload();
+                }
+                PrEvent::PreloadDetails {
+                    key,
+                    updated_at,
+                    result,
+                } => {
+                    // Queue the files of the PR whose details just came in.
+                    if self.preloader.apply_details(&key, &updated_at, result) {
+                        self.sync_preload();
+                    }
+                }
+                PrEvent::PreloadFile {
+                    key,
+                    head_sha,
+                    path,
+                    result,
+                } => {
+                    let versions = result.as_ref().ok().cloned();
+                    self.preloader.apply_file(&key, &head_sha, &path, result);
+                    // Hand it to the open review if it's the same PR and head.
+                    let Some(session) = self.pr.as_mut().filter(|s| {
+                        pr::pr_key(&s.account, &s.summary) == key
+                            && s.details().is_some_and(|d| d.head_sha == head_sha)
+                    }) else {
+                        continue;
+                    };
+                    let Some((old, new)) = versions else {
+                        continue;
+                    };
+                    if session.contents.contains_key(&path) {
+                        continue;
+                    }
+                    session
+                        .contents
+                        .insert(path.clone(), (old.clone(), new.clone()));
+                    let current = self
+                        .files
+                        .get(self.selected)
+                        .filter(|e| e.path == path && self.diff_loading)
+                        .cloned();
+                    if let Some(entry) = current {
+                        self.show_versions(&entry, old, new);
+                    }
                 }
                 PrEvent::Session { generation, result } => {
                     let tx = self.pr_tx.clone();
@@ -1565,17 +1638,38 @@ impl App {
             }
         }
         self.pr_generation += 1;
-        pr::spawn_session(
-            self.pr_tx.clone(),
-            self.pr_generation,
-            account.clone(),
-            summary.repo.clone(),
-            summary.number,
-        );
-        self.pr = Some(pr::PrSession::new(self.pr_generation, account, summary));
+        let preloaded = self.preloader.take(&account, &summary);
+        if preloaded.is_none() {
+            pr::spawn_session(
+                self.pr_tx.clone(),
+                self.pr_generation,
+                account.clone(),
+                summary.repo.clone(),
+                summary.number,
+            );
+        }
+        let local = self
+            .workspace
+            .as_ref()
+            .and_then(|ws| ws.local_for(&summary.repo));
+        let mut session = pr::PrSession::new(self.pr_generation, account, summary);
         self.pr_list_open = false;
-        self.clear_view_state();
-        self.diff_loading = true;
+        match preloaded {
+            // Fetched in the background while the list was open: show it
+            // now, as fresh as the list it came from (r refreshes).
+            Some((details, contents)) => {
+                session.set_details(details, self.pr_tx.clone(), local);
+                session.contents = contents;
+                self.pr = Some(session);
+                self.clear_view_state();
+                self.reload();
+            }
+            None => {
+                self.pr = Some(session);
+                self.clear_view_state();
+                self.diff_loading = true;
+            }
+        }
     }
 
     /// Stop reviewing and return to the PR list (the local diff is

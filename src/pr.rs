@@ -1,12 +1,13 @@
 //! Pull request view state: the PR list (tabs, account/state/draft/text
 //! filters and a per-query result cache), the per-PR review session
 //! (fetched files, cached contents, draft inline comments), the comment
-//! and review editors, and the background `gh` jobs feeding them through
-//! one event channel. Rendering lives in `pr_ui.rs`, key handling in
+//! and review editors, the background preloader that fetches the PRs of
+//! the open list tab ahead of time, and the background `gh` jobs feeding
+//! them through one event channel. Rendering lives in `pr_ui.rs`, key handling in
 //! `app.rs`.
 
-use std::collections::HashMap;
-use std::sync::mpsc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::gh::{self, Account, DraftComment, PrDetails, PrSummary, ReviewEvent, Side};
@@ -144,6 +145,17 @@ pub enum PrEvent {
         generation: u64,
         event: ReviewEvent,
         result: Result<(), String>,
+    },
+    PreloadDetails {
+        key: PrKey,
+        updated_at: String,
+        result: Result<PrDetails, String>,
+    },
+    PreloadFile {
+        key: PrKey,
+        head_sha: String,
+        path: String,
+        result: Result<(String, String), String>,
     },
 }
 
@@ -552,36 +564,8 @@ fn spawn_file_worker(
             while let Ok(newer) = job_rx.try_recv() {
                 job = newer;
             }
-            let fetch = |sha: &str, path: &str| -> Result<String, String> {
-                if let Some(text) = local.as_ref().and_then(|r| r.show_at(sha, path)) {
-                    return Ok(text);
-                }
-                gh::file_content(&account, &repo, sha, path).map_err(|e| e.to_string())
-            };
             let entry = &job.entry;
-            let old_path = match &entry.status {
-                FileStatus::Renamed { from } => from.as_str(),
-                _ => entry.path.as_str(),
-            };
-            let old = match entry.status {
-                FileStatus::Added => Ok(String::new()),
-                _ => fetch(&base_sha, old_path),
-            };
-            let new = match entry.status {
-                FileStatus::Deleted => Ok(String::new()),
-                _ => fetch(&head_sha, &entry.path),
-            };
-            let result = old.and_then(|o| new.map(|n| (o, n))).and_then(|(o, n)| {
-                // Diffing happens on the UI thread; keep a huge file in an
-                // untrusted PR from freezing it.
-                if o.len().max(n.len()) > MAX_FILE_BYTES {
-                    return Err(format!(
-                        "file too large to display (over {} MB)",
-                        MAX_FILE_BYTES >> 20
-                    ));
-                }
-                Ok((gh::sanitize_text(&o), gh::sanitize_text(&n)))
-            });
+            let result = fetch_versions(&account, &repo, &base_sha, &head_sha, entry, &local);
             let event = PrEvent::File {
                 generation: job.generation,
                 path: entry.path.clone(),
@@ -593,6 +577,368 @@ fn spawn_file_worker(
         }
     });
     job_tx
+}
+
+/// Both versions of `entry`, sanitized for display. Commits present in
+/// the local repository are read with `git show` instead of the API.
+fn fetch_versions(
+    account: &Account,
+    repo: &str,
+    base_sha: &str,
+    head_sha: &str,
+    entry: &FileEntry,
+    local: &Option<GitRepo>,
+) -> Result<(String, String), String> {
+    let fetch = |sha: &str, path: &str| -> Result<String, String> {
+        if let Some(text) = local.as_ref().and_then(|r| r.show_at(sha, path)) {
+            return Ok(text);
+        }
+        gh::file_content(account, repo, sha, path).map_err(|e| e.to_string())
+    };
+    let old_path = match &entry.status {
+        FileStatus::Renamed { from } => from.as_str(),
+        _ => entry.path.as_str(),
+    };
+    let old = match entry.status {
+        FileStatus::Added => Ok(String::new()),
+        _ => fetch(base_sha, old_path),
+    };
+    let new = match entry.status {
+        FileStatus::Deleted => Ok(String::new()),
+        _ => fetch(head_sha, &entry.path),
+    };
+    old.and_then(|o| new.map(|n| (o, n))).and_then(|(o, n)| {
+        // Diffing happens on the UI thread; keep a huge file in an
+        // untrusted PR from freezing it.
+        if o.len().max(n.len()) > MAX_FILE_BYTES {
+            return Err(format!(
+                "file too large to display (over {} MB)",
+                MAX_FILE_BYTES >> 20
+            ));
+        }
+        Ok((gh::sanitize_text(&o), gh::sanitize_text(&n)))
+    })
+}
+
+/// One PR as seen by one account: (host, login, PR url).
+pub type PrKey = (String, String, String);
+
+pub fn pr_key(account: &Account, pr: &PrSummary) -> PrKey {
+    (account.host.clone(), account.login.clone(), pr.url.clone())
+}
+
+/// (old, new) contents per path.
+pub type FileContents = HashMap<String, (String, String)>;
+
+/// Background fetches running at once.
+const PRELOAD_WORKERS: usize = 4;
+/// Files preloaded per PR; the rest load when opened.
+const PRELOAD_MAX_FILES: usize = 100;
+/// Total file contents kept preloaded, in bytes.
+const PRELOAD_BUDGET: usize = 256 << 20;
+
+/// A PR fetched ahead of being opened.
+pub struct Preloaded {
+    /// The summary's `updatedAt` when fetched; a newer one makes it stale.
+    updated_at: String,
+    details: Load<PrDetails>,
+    /// (old, new) contents per path; `Loading` while queued or in flight.
+    files: HashMap<String, Load<(String, String)>>,
+}
+
+/// How far preloading of one PR has got, for the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreloadStatus {
+    Loading,
+    Ready,
+    Failed,
+}
+
+/// A PR the open list view shows, to preload.
+pub struct PreloadTarget {
+    pub account: Account,
+    pub summary: PrSummary,
+    /// Local clone to read commits from, if any.
+    pub local: Option<GitRepo>,
+}
+
+enum PreloadJob {
+    Details {
+        key: PrKey,
+        updated_at: String,
+        account: Account,
+        repo: String,
+        number: u64,
+    },
+    File {
+        key: PrKey,
+        account: Account,
+        repo: String,
+        base_sha: String,
+        head_sha: String,
+        entry: FileEntry,
+        local: Option<GitRepo>,
+    },
+}
+
+type JobQueue = Arc<(Mutex<VecDeque<PreloadJob>>, Condvar)>;
+
+/// Fetches details and file contents of every PR in the open list view
+/// on a small worker pool, so opening one shows it at once. The queue is
+/// rebuilt in list order whenever the view changes; jobs of PRs that left
+/// the view are dropped before they start.
+pub struct Preloader {
+    cache: HashMap<PrKey, Preloaded>,
+    queue: JobQueue,
+    tx: mpsc::Sender<PrEvent>,
+    /// Workers still to spawn; they start with the first job.
+    idle_workers: usize,
+    bytes: usize,
+}
+
+impl Preloader {
+    pub fn new(tx: mpsc::Sender<PrEvent>) -> Self {
+        Self::with_workers(tx, PRELOAD_WORKERS)
+    }
+
+    fn with_workers(tx: mpsc::Sender<PrEvent>, workers: usize) -> Self {
+        Preloader {
+            cache: HashMap::new(),
+            queue: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
+            tx,
+            idle_workers: workers,
+            bytes: 0,
+        }
+    }
+
+    /// Preload `targets` (in priority order) and nothing else: queued work
+    /// for other PRs is dropped, missing work for these is queued.
+    pub fn retarget(&mut self, targets: Vec<PreloadTarget>) {
+        let shared = self.queue.clone();
+        let (lock, cvar) = &*shared;
+        let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+        // Un-mark everything not yet started; the plan below re-queues
+        // whatever is still wanted, in the new order.
+        for job in queue.drain(..) {
+            match job {
+                PreloadJob::Details { key, .. } => {
+                    self.cache.remove(&key);
+                }
+                PreloadJob::File { key, entry, .. } => {
+                    if let Some(p) = self.cache.get_mut(&key) {
+                        p.files.remove(&entry.path);
+                    }
+                }
+            }
+        }
+        for target in targets {
+            let key = pr_key(&target.account, &target.summary);
+            if self
+                .cache
+                .get(&key)
+                .is_some_and(|p| p.updated_at != target.summary.updated_at)
+            {
+                self.forget(&key);
+            }
+            let Some(preloaded) = self.cache.get_mut(&key) else {
+                self.cache.insert(
+                    key.clone(),
+                    Preloaded {
+                        updated_at: target.summary.updated_at.clone(),
+                        details: Load::Loading,
+                        files: HashMap::new(),
+                    },
+                );
+                queue.push_back(PreloadJob::Details {
+                    key,
+                    updated_at: target.summary.updated_at,
+                    account: target.account,
+                    repo: target.summary.repo,
+                    number: target.summary.number,
+                });
+                continue;
+            };
+            let Load::Ready(details) = &preloaded.details else {
+                continue;
+            };
+            for file in details.files.iter().take(PRELOAD_MAX_FILES) {
+                if self.bytes >= PRELOAD_BUDGET {
+                    break;
+                }
+                if file.entry.binary || preloaded.files.contains_key(&file.entry.path) {
+                    continue;
+                }
+                preloaded
+                    .files
+                    .insert(file.entry.path.clone(), Load::Loading);
+                queue.push_back(PreloadJob::File {
+                    key: key.clone(),
+                    account: target.account.clone(),
+                    repo: target.summary.repo.clone(),
+                    base_sha: details.base_sha.clone(),
+                    head_sha: details.head_sha.clone(),
+                    entry: file.entry.clone(),
+                    local: target.local.clone(),
+                });
+            }
+        }
+        if !queue.is_empty() {
+            for _ in 0..std::mem::take(&mut self.idle_workers) {
+                spawn_preload_worker(self.queue.clone(), self.tx.clone());
+            }
+            cvar.notify_all();
+        }
+    }
+
+    fn forget(&mut self, key: &PrKey) {
+        if let Some(p) = self.cache.remove(key) {
+            self.bytes -= p.files.values().map(load_size).sum::<usize>();
+        }
+    }
+
+    /// Store fetched details; false when they're stale or unasked for.
+    pub fn apply_details(
+        &mut self,
+        key: &PrKey,
+        updated_at: &str,
+        result: Result<PrDetails, String>,
+    ) -> bool {
+        let Some(preloaded) = self
+            .cache
+            .get_mut(key)
+            .filter(|p| p.updated_at == updated_at && matches!(p.details, Load::Loading))
+        else {
+            return false;
+        };
+        preloaded.details = match result {
+            Ok(details) => Load::Ready(details),
+            Err(e) => Load::Failed(e),
+        };
+        true
+    }
+
+    /// Store fetched contents of `path`; false when stale or unasked for.
+    pub fn apply_file(
+        &mut self,
+        key: &PrKey,
+        head_sha: &str,
+        path: &str,
+        result: Result<(String, String), String>,
+    ) -> bool {
+        let Some(preloaded) = self.cache.get_mut(key) else {
+            return false;
+        };
+        let current = matches!(&preloaded.details, Load::Ready(d) if d.head_sha == head_sha);
+        let Some(slot) = preloaded.files.get_mut(path).filter(|_| current) else {
+            return false;
+        };
+        *slot = match result {
+            Ok(versions) => Load::Ready(versions),
+            Err(e) => Load::Failed(e),
+        };
+        self.bytes += load_size(slot);
+        true
+    }
+
+    /// Preloaded details and ready file contents of `summary`, if its
+    /// details are in and still match the list.
+    pub fn take(
+        &self,
+        account: &Account,
+        summary: &PrSummary,
+    ) -> Option<(PrDetails, FileContents)> {
+        let preloaded = self
+            .cache
+            .get(&pr_key(account, summary))
+            .filter(|p| p.updated_at == summary.updated_at)?;
+        let Load::Ready(details) = &preloaded.details else {
+            return None;
+        };
+        let contents = preloaded
+            .files
+            .iter()
+            .filter_map(|(path, load)| match load {
+                Load::Ready(v) => Some((path.clone(), v.clone())),
+                _ => None,
+            })
+            .collect();
+        Some((details.clone(), contents))
+    }
+
+    pub fn status(&self, account: &Account, summary: &PrSummary) -> Option<PreloadStatus> {
+        let preloaded = self
+            .cache
+            .get(&pr_key(account, summary))
+            .filter(|p| p.updated_at == summary.updated_at)?;
+        Some(match &preloaded.details {
+            Load::Loading => PreloadStatus::Loading,
+            Load::Failed(_) => PreloadStatus::Failed,
+            Load::Ready(_) if preloaded.files.values().any(|f| matches!(f, Load::Loading)) => {
+                PreloadStatus::Loading
+            }
+            Load::Ready(_) => PreloadStatus::Ready,
+        })
+    }
+
+    /// Jobs not yet picked up by a worker.
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.queue.0.lock().unwrap().len()
+    }
+}
+
+fn load_size(load: &Load<(String, String)>) -> usize {
+    match load {
+        Load::Ready((old, new)) => old.len() + new.len(),
+        _ => 0,
+    }
+}
+
+/// One preload worker: takes jobs off the shared queue for as long as
+/// the app runs.
+fn spawn_preload_worker(queue: JobQueue, tx: mpsc::Sender<PrEvent>) {
+    std::thread::spawn(move || loop {
+        let job = {
+            let (lock, cvar) = &*queue;
+            let mut jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(job) = jobs.pop_front() {
+                    break job;
+                }
+                jobs = cvar.wait(jobs).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let event = match job {
+            PreloadJob::Details {
+                key,
+                updated_at,
+                account,
+                repo,
+                number,
+            } => PrEvent::PreloadDetails {
+                key,
+                updated_at,
+                result: gh::pr_details(&account, &repo, number).map_err(|e| e.to_string()),
+            },
+            PreloadJob::File {
+                key,
+                account,
+                repo,
+                base_sha,
+                head_sha,
+                entry,
+                local,
+            } => PrEvent::PreloadFile {
+                result: fetch_versions(&account, &repo, &base_sha, &head_sha, &entry, &local),
+                key,
+                head_sha,
+                path: entry.path,
+            },
+        };
+        if tx.send(event).is_err() {
+            return;
+        }
+    });
 }
 
 /// Compact age of an ISO-8601 UTC timestamp, e.g. `5m`, `3h`, `2d`, `4w`.
@@ -707,6 +1053,109 @@ mod tests {
         modal.cycle_event(true);
         assert_eq!(modal.event, ReviewEvent::RequestChanges);
         assert!(modal.validate(3).is_some());
+    }
+
+    fn details(head: &str, paths: &[&str]) -> PrDetails {
+        PrDetails {
+            head_sha: head.into(),
+            base_sha: "b".repeat(40),
+            body: String::new(),
+            files: paths
+                .iter()
+                .map(|p| gh::PrFile {
+                    entry: FileEntry {
+                        path: p.to_string(),
+                        status: FileStatus::Modified,
+                        additions: 1,
+                        deletions: 1,
+                        binary: false,
+                    },
+                    patch: None,
+                    commentable: Default::default(),
+                })
+                .collect(),
+        }
+    }
+
+    fn target(account: &Account, summary: &PrSummary) -> PreloadTarget {
+        PreloadTarget {
+            account: account.clone(),
+            summary: summary.clone(),
+            local: None,
+        }
+    }
+
+    #[test]
+    fn preloader_fetches_details_then_files() {
+        let (tx, _rx) = mpsc::channel();
+        let mut preloader = Preloader::with_workers(tx, 0);
+        let account = Account::for_test("alice");
+        let mut summary = pr(1, "a", "2026-10-01T00:00:00Z", false);
+        summary.url = "https://github.com/o/r/pull/1".into();
+        let key = pr_key(&account, &summary);
+
+        preloader.retarget(vec![target(&account, &summary)]);
+        assert_eq!(preloader.queued(), 1);
+        assert_eq!(
+            preloader.status(&account, &summary),
+            Some(PreloadStatus::Loading)
+        );
+        assert!(preloader.take(&account, &summary).is_none());
+
+        // Details arrive: the worker took the job, so the queue is empty
+        // and re-planning queues one job per file.
+        preloader.queue.0.lock().unwrap().clear();
+        let head = "a".repeat(40);
+        assert!(preloader.apply_details(
+            &key,
+            &summary.updated_at,
+            Ok(details(&head, &["x", "y"]))
+        ));
+        preloader.retarget(vec![target(&account, &summary)]);
+        assert_eq!(preloader.queued(), 2);
+
+        preloader.queue.0.lock().unwrap().clear();
+        assert!(preloader.apply_file(&key, &head, "x", Ok(("o".into(), "n".into()))));
+        assert!(!preloader.apply_file(&key, "stale", "y", Ok(Default::default())));
+        assert!(preloader.apply_file(&key, &head, "y", Err("boom".into())));
+        assert_eq!(
+            preloader.status(&account, &summary),
+            Some(PreloadStatus::Ready)
+        );
+        let (got, contents) = preloader.take(&account, &summary).unwrap();
+        assert_eq!(got.files.len(), 2);
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents["x"], ("o".to_string(), "n".to_string()));
+
+        // A newer list entry makes the preload stale and starts over.
+        summary.updated_at = "2026-10-02T00:00:00Z".into();
+        assert!(preloader.take(&account, &summary).is_none());
+        preloader.retarget(vec![target(&account, &summary)]);
+        assert_eq!(preloader.queued(), 1);
+        assert_eq!(preloader.bytes, 0);
+    }
+
+    #[test]
+    fn preloader_drops_queued_work_outside_the_view() {
+        let (tx, _rx) = mpsc::channel();
+        let mut preloader = Preloader::with_workers(tx, 0);
+        let account = Account::for_test("alice");
+        let mut one = pr(1, "a", "2026-10-01T00:00:00Z", false);
+        one.url = "u1".into();
+        let mut two = pr(2, "b", "2026-10-01T00:00:00Z", false);
+        two.url = "u2".into();
+
+        preloader.retarget(vec![target(&account, &one), target(&account, &two)]);
+        assert_eq!(preloader.queued(), 2);
+        preloader.retarget(vec![target(&account, &two)]);
+        assert_eq!(preloader.queued(), 1);
+        assert_eq!(preloader.status(&account, &one), None);
+        // A late result for a dropped job is ignored.
+        assert!(!preloader.apply_details(
+            &pr_key(&account, &one),
+            &one.updated_at,
+            Ok(details("h", &[]))
+        ));
     }
 
     #[test]

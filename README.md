@@ -162,6 +162,15 @@ refreshed. Rows show state (● open/merged/closed, ◌ draft), `repo#number`,
 title, account (when more than one), author, `+added -removed`, review
 decision and age.
 
+The PRs in the open tab (after filters) preload in the background, top row
+first: details, then the contents of up to 100 files per PR, 4 fetches at a
+time, up to 256 MB in total. `◇` after the state glyph means the PR is still loading,
+`◆` means it is ready and opens at once, and the status line shows
+`preloaded: n/m`. When you switch tabs or filters, queued work for PRs that
+are no longer shown is dropped. A preloaded PR is as fresh as the list it came from;
+press `r` to refresh. Preloading uses the GitHub API rate limit (about two
+requests per file).
+
 | Key | Action |
 |---|---|
 | `j` / `k`, `↓` / `↑` | select |

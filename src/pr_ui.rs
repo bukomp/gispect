@@ -10,7 +10,7 @@ use ratatui::Frame;
 
 use crate::app::App;
 use crate::gh::{PrSummary, ReviewEvent, Side};
-use crate::pr::{self, Load, PrList, PrTab};
+use crate::pr::{self, Load, PrList, PrTab, PreloadStatus, Preloader};
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
@@ -29,13 +29,23 @@ pub fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(list) = app.pr_list.as_mut() else {
         return;
     };
-    draw_list_status(f, list, chunks[0]);
+    let statuses = preload_statuses(list, &app.preloader);
+    draw_list_status(f, list, &statuses, chunks[0]);
     draw_tabs(f, list, chunks[1]);
-    draw_rows(f, list, chunks[2]);
+    draw_rows(f, list, &statuses, chunks[2]);
     draw_list_footer(f, list, status, chunks[3]);
 }
 
-fn draw_list_status(f: &mut Frame, list: &PrList, area: Rect) {
+/// Preload progress of each list row, in row order.
+fn preload_statuses(list: &PrList, preloader: &Preloader) -> Vec<Option<PreloadStatus>> {
+    let accounts = list.account_list();
+    list.rows()
+        .into_iter()
+        .map(|(a, pr)| preloader.status(accounts.get(a)?, pr))
+        .collect()
+}
+
+fn draw_list_status(f: &mut Frame, list: &PrList, statuses: &[Option<PreloadStatus>], area: Rect) {
     let accounts = match &list.accounts {
         Load::Loading => "loading…".to_string(),
         Load::Failed(_) => "unavailable".to_string(),
@@ -55,6 +65,13 @@ fn draw_list_status(f: &mut Frame, list: &PrList, area: Rect) {
     );
     if let Some(filter) = &list.text_filter {
         text.push_str(&format!(" | filter: {filter}"));
+    }
+    let ready = statuses
+        .iter()
+        .filter(|s| **s == Some(PreloadStatus::Ready))
+        .count();
+    if !statuses.is_empty() {
+        text.push_str(&format!(" | preloaded: {ready}/{}", statuses.len()));
     }
     f.render_widget(Paragraph::new(text), area);
 }
@@ -85,7 +102,7 @@ fn draw_tabs(f: &mut Frame, list: &PrList, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_rows(f: &mut Frame, list: &mut PrList, area: Rect) {
+fn draw_rows(f: &mut Frame, list: &mut PrList, statuses: &[Option<PreloadStatus>], area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(format!(
         " {} — {} ",
         list.tab.label(),
@@ -159,6 +176,7 @@ fn draw_rows(f: &mut Frame, list: &mut PrList, area: Rect) {
                 pr_row(
                     pr,
                     account,
+                    statuses.get(i).copied().flatten(),
                     &cols,
                     rows_area.width as usize,
                     i == list.selected,
@@ -203,6 +221,7 @@ fn repo_label(pr: &PrSummary) -> String {
 fn pr_row(
     pr: &PrSummary,
     account: Option<String>,
+    preload: Option<PreloadStatus>,
     cols: &Columns,
     width: usize,
     selected: bool,
@@ -220,8 +239,21 @@ fn pr_row(
         _ => ("", Color::Reset),
     };
 
+    // Hollow while files are still being fetched, filled once opening
+    // the PR is instant.
+    let (preload_glyph, preload_color) = match preload {
+        Some(PreloadStatus::Ready) => ("◆", Color::DarkGray),
+        Some(PreloadStatus::Loading) => ("◇", Color::DarkGray),
+        Some(PreloadStatus::Failed) => ("!", Color::Red),
+        None => (" ", Color::Reset),
+    };
+
     let left = vec![
-        Span::styled(format!(" {glyph} "), Style::default().fg(glyph_color)),
+        Span::styled(format!(" {glyph}"), Style::default().fg(glyph_color)),
+        Span::styled(
+            format!("{preload_glyph} "),
+            Style::default().fg(preload_color),
+        ),
         Span::styled(
             format!(
                 "{:<w$} ",
