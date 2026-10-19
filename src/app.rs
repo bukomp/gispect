@@ -20,8 +20,10 @@ use ratatui::layout::{Position, Rect};
 use ratatui::Terminal;
 
 use crate::config;
+use crate::gh::{self, Side};
 use crate::git::GitRepo;
 use crate::highlight::{self, HlLines};
+use crate::pr::{self, Load, PrEvent};
 use crate::search;
 use crate::types::{DiffMode, FileEntry, FileStatus, RowKind, SideBySideDiff};
 use crate::{diff, update};
@@ -84,7 +86,8 @@ pub(crate) enum UpdateState {
 
 /// All state needed to render and drive the TUI.
 pub struct App {
-    pub(crate) repo: GitRepo,
+    /// Local repository; `None` when launched outside one (`gispect prs`).
+    pub(crate) repo: Option<GitRepo>,
     pub(crate) mode: DiffMode,
     pub(crate) base: String,
     pub(crate) branch: String,
@@ -176,19 +179,51 @@ pub struct App {
     pub(crate) config: config::Config,
     /// Open config modal, if any; `Some` swallows most key handling.
     pub(crate) config_modal: Option<config::ConfigModal>,
+    /// PR list state, kept across visits so results stay cached.
+    pub(crate) pr_list: Option<pr::PrList>,
+    /// Whether the PR list screen is showing.
+    pub(crate) pr_list_open: bool,
+    /// PR under review; while `Some`, files and diffs come from it
+    /// instead of the local repository.
+    pub(crate) pr: Option<pr::PrSession>,
+    /// Bumped per opened PR so late results from a previous one are dropped.
+    pr_generation: u64,
+    pr_tx: mpsc::Sender<PrEvent>,
+    pr_rx: mpsc::Receiver<PrEvent>,
+    /// Selected local file, restored when leaving a PR review.
+    local_selected_path: Option<String>,
+    /// The selected PR file's contents are still being fetched.
+    pub(crate) diff_loading: bool,
+    /// Line cursor for inline comments (aligned row index; PR review only).
+    pub(crate) cursor: usize,
+    /// Open inline comment editor, if any.
+    pub(crate) comment_editor: Option<pr::CommentEditor>,
+    /// Open review submission modal, if any.
+    pub(crate) review_modal: Option<pr::ReviewModal>,
+    /// Scroll of the PR description popup; `Some` while it is open.
+    pub(crate) pr_info_scroll: Option<u16>,
+    /// Set by a first quit/leave with unsent drafts; a second one confirms.
+    discard_armed: bool,
 }
 
 impl App {
-    fn new(repo: GitRepo, mode: DiffMode, config: config::Config) -> Self {
-        let base = match &mode {
-            DiffMode::BranchToBase { base } => base.clone(),
-            _ => repo.default_base(),
+    fn new(repo: Option<GitRepo>, mode: DiffMode, config: config::Config) -> Self {
+        let base = match (&mode, &repo) {
+            (DiffMode::BranchToBase { base }, _) => base.clone(),
+            (_, Some(repo)) => repo.default_base(),
+            (_, None) => "main".to_string(),
         };
-        let branch = repo.current_branch();
-        let base_choices = repo.local_branches().unwrap_or_default();
+        let branch = repo.as_ref().map(GitRepo::current_branch).unwrap_or_default();
+        let base_choices = repo
+            .as_ref()
+            .and_then(|r| r.local_branches().ok())
+            .unwrap_or_default();
         let (hl_jobs, hl_results) = spawn_highlight_worker();
         let repo_changed = Arc::new(AtomicBool::new(false));
-        spawn_repo_watcher(repo.clone(), repo_changed.clone());
+        if let Some(repo) = &repo {
+            spawn_repo_watcher(repo.clone(), repo_changed.clone());
+        }
+        let (pr_tx, pr_rx) = mpsc::channel();
         let compact = config.compact;
         let syntax = config.syntax;
         let show_files = config.show_files;
@@ -248,6 +283,19 @@ impl App {
             awaiting_update_exit: false,
             config,
             config_modal: None,
+            pr_list: None,
+            pr_list_open: false,
+            pr: None,
+            pr_generation: 0,
+            pr_tx,
+            pr_rx,
+            local_selected_path: None,
+            diff_loading: false,
+            cursor: 0,
+            comment_editor: None,
+            review_modal: None,
+            pr_info_scroll: None,
+            discard_armed: false,
         }
     }
 
@@ -282,7 +330,15 @@ impl App {
         if self.active_content_filter().is_some() {
             self.ensure_changed_lines();
         }
-        match self.repo.changed_files(&self.mode) {
+        let files = match (&self.pr, &self.repo) {
+            (Some(session), _) => Ok(session
+                .details()
+                .map(|d| d.files.iter().map(|f| f.entry.clone()).collect())
+                .unwrap_or_default()),
+            (None, Some(repo)) => repo.changed_files(&self.mode),
+            (None, None) => Ok(Vec::new()),
+        };
+        match files {
             Ok(files) => {
                 self.files = files;
                 if self.selected >= self.files.len() {
@@ -348,7 +404,35 @@ impl App {
         if self.changed_lines.is_some() {
             return;
         }
-        match self.repo.unified_diff(&self.mode, None) {
+        if let Some(session) = &self.pr {
+            // GitHub's per-file patches carry the same +/- lines.
+            let lines = session
+                .details()
+                .map(|d| {
+                    d.files
+                        .iter()
+                        .map(|f| {
+                            let changed = f
+                                .patch
+                                .as_deref()
+                                .unwrap_or_default()
+                                .lines()
+                                .filter_map(|l| l.strip_prefix('+').or_else(|| l.strip_prefix('-')))
+                                .map(str::to_string)
+                                .collect();
+                            (f.entry.path.clone(), changed)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.changed_lines = Some(lines);
+            return;
+        }
+        let Some(repo) = &self.repo else {
+            self.changed_lines = Some(HashMap::new());
+            return;
+        };
+        match repo.unified_diff(&self.mode, None) {
             Ok(diff) => self.changed_lines = Some(search::parse_changed_lines(&diff)),
             Err(e) => {
                 self.changed_lines = Some(HashMap::new());
@@ -385,6 +469,8 @@ impl App {
         self.hl_generation += 1;
         self.left_hl = Arc::new(Vec::new());
         self.right_hl = Arc::new(Vec::new());
+        self.diff_loading = false;
+        self.cursor = 0;
         let Some(entry) = self.files.get(self.selected).cloned() else {
             return;
         };
@@ -392,21 +478,39 @@ impl App {
             self.set_status("binary file".to_string());
             return;
         }
-        match self.repo.file_versions(&self.mode, &entry) {
-            Ok((old, new)) => {
-                self.diff = diff::side_by_side(&old, &new);
-                if self.syntax {
-                    let old_path = match &entry.status {
-                        FileStatus::Renamed { from } => from.clone(),
-                        _ => entry.path.clone(),
-                    };
-                    self.request_highlight(true, old_path, old);
-                    self.request_highlight(false, entry.path.clone(), new);
+        let versions = match (&self.pr, &self.repo) {
+            (Some(session), _) => match session.contents.get(&entry.path) {
+                Some(v) => Ok(v.clone()),
+                None => {
+                    // Shown when the fetch worker reports back.
+                    session.request_file(&entry);
+                    self.diff_loading = true;
+                    return;
                 }
-            }
+            },
+            (None, Some(repo)) => repo.file_versions(&self.mode, &entry),
+            (None, None) => return,
+        };
+        match versions {
+            Ok((old, new)) => self.show_versions(&entry, old, new),
             Err(e) => {
                 self.set_status(format!("error: {e}"));
             }
+        }
+    }
+
+    /// Display a freshly loaded (old, new) pair for `entry`: build the
+    /// side-by-side diff, queue highlighting, re-run an active search.
+    fn show_versions(&mut self, entry: &FileEntry, old: String, new: String) {
+        self.diff_loading = false;
+        self.diff = diff::side_by_side(&old, &new);
+        if self.syntax {
+            let old_path = match &entry.status {
+                FileStatus::Renamed { from } => from.clone(),
+                _ => entry.path.clone(),
+            };
+            self.request_highlight(true, old_path, old);
+            self.request_highlight(false, entry.path.clone(), new);
         }
         // Keep an active in-file search in sync with the newly loaded diff.
         if let Some(fs) = &mut self.file_search {
@@ -456,15 +560,19 @@ impl App {
     /// If the watcher flagged a repository change, reload while keeping
     /// the selected file (matched by path) and scroll position.
     pub(crate) fn poll_auto_refresh(&mut self) {
-        if !self.repo_changed.swap(false, Ordering::Relaxed) {
+        // A PR review doesn't follow the local repo; leaving it reloads.
+        if self.pr.is_some() || !self.repo_changed.swap(false, Ordering::Relaxed) {
             return;
         }
+        let Some(repo) = &self.repo else {
+            return;
+        };
         let selected_path = self.files.get(self.selected).map(|e| e.path.clone());
         let scroll = self.scroll;
         let h_scroll_old = self.h_scroll_old;
         let h_scroll_new = self.h_scroll_new;
         let h_scroll_files = self.h_scroll_files;
-        match self.repo.changed_files(&self.mode) {
+        match repo.changed_files(&self.mode) {
             Ok(files) => self.files = files,
             // Transient failure (e.g. mid-rebase): keep the current view.
             Err(_) => return,
@@ -563,6 +671,7 @@ impl App {
         };
         match target {
             Some(i) => {
+                self.cursor = starts[i];
                 self.scroll = positions[i].saturating_sub(JUMP_PADDING);
                 self.clamp_scroll();
                 self.set_status(format!("change {}/{}", i + 1, positions.len()));
@@ -810,6 +919,7 @@ impl App {
         if let Some(fs) = &mut self.file_search {
             fs.current = idx;
         }
+        self.cursor = row;
         self.scroll = self.row_to_scroll(row).saturating_sub(JUMP_PADDING);
         self.clamp_scroll();
         self.set_status(format!("match {}/{}", idx + 1, total));
@@ -833,6 +943,26 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        // Any key other than a repeated quit/leave disarms the draft
+        // discard confirmation.
+        let armed = std::mem::take(&mut self.discard_armed);
+        if self.pr_list_open {
+            self.handle_pr_list_key(code, modifiers, armed);
+            return;
+        }
+        // PR modals take text input, so they come before everything else.
+        if self.comment_editor.is_some() {
+            self.handle_comment_key(code, modifiers);
+            return;
+        }
+        if self.review_modal.is_some() {
+            self.handle_review_key(code, modifiers);
+            return;
+        }
+        if self.pr_info_scroll.is_some() {
+            self.handle_info_key(code);
+            return;
+        }
         // A search prompt swallows everything: keys are text input.
         if self.search_input.is_some() {
             self.handle_search_input(code, modifiers);
@@ -852,10 +982,15 @@ impl App {
             }
             return;
         }
+        if self.pr.is_some() && self.handle_pr_review_key(code) {
+            self.clamp_cursor_to_view();
+            return;
+        }
 
         match code {
-            KeyCode::Char('q') => self.quit = true,
-            // Esc peels back one layer of search state before quitting.
+            KeyCode::Char('q') => self.request_quit(armed),
+            // Esc peels back one layer of search state before quitting
+            // (or, in a PR review, before going back to the PR list).
             KeyCode::Esc => {
                 if self.file_search.take().is_some() {
                     self.set_status("search cleared".to_string());
@@ -863,10 +998,13 @@ impl App {
                     self.set_status("content filter cleared".to_string());
                 } else if self.path_filter.take().is_some() {
                     self.set_status("file filter cleared".to_string());
+                } else if self.pr.is_some() {
+                    self.leave_pr(armed);
                 } else {
                     self.quit = true;
                 }
             }
+            KeyCode::Char('P') => self.open_pr_list(),
             KeyCode::Char('/') => self.open_search(search::SearchKind::File),
             KeyCode::Char('S') => self.open_search(search::SearchKind::Content),
             KeyCode::Char('p') => self.open_search(search::SearchKind::PathFilter),
@@ -999,6 +1137,9 @@ impl App {
             }
             _ => {}
         }
+        if self.pr.is_some() {
+            self.clamp_cursor_to_view();
+        }
     }
 
     /// Route a key press into the open config modal: navigate, toggle the
@@ -1108,9 +1249,24 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.mouse_pos = (mouse.column, mouse.row);
-        if self.show_help {
+        if self.pr_list_open {
+            self.handle_pr_list_mouse(mouse);
             return;
         }
+        if self.show_help
+            || self.comment_editor.is_some()
+            || self.review_modal.is_some()
+            || self.pr_info_scroll.is_some()
+        {
+            return;
+        }
+        self.handle_diff_mouse(mouse);
+        if self.pr.is_some() {
+            self.clamp_cursor_to_view();
+        }
+    }
+
+    fn handle_diff_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollDown => {
                 if self.over_files() {
@@ -1136,10 +1292,764 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.over_files() {
                     self.click_file(mouse.row);
+                } else if self.pr.is_some() && (self.over_old() || self.over_new()) {
+                    let left = self.over_old();
+                    self.click_diff_row(mouse.row, left);
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// Pull request list and review.
+impl App {
+    /// Show the PR list, loading accounts the first time.
+    fn open_pr_list(&mut self) {
+        if self.pr_list.is_none() {
+            self.pr_list = Some(pr::PrList::new());
+            pr::spawn_accounts(self.pr_tx.clone());
+        }
+        self.pr_list_open = true;
+        self.start_list_queries();
+    }
+
+    fn list_mut(&mut self) -> &mut pr::PrList {
+        self.pr_list.get_or_insert_with(pr::PrList::new)
+    }
+
+    /// Start any searches the list's current view still needs.
+    fn start_list_queries(&mut self) {
+        let Some(list) = self.pr_list.as_mut() else {
+            return;
+        };
+        for key in list.missing_queries() {
+            if let Some(account) = list.account_list().get(key.0).cloned() {
+                list.results.insert(key, Load::Loading);
+                pr::spawn_search(self.pr_tx.clone(), key, account);
+            }
+        }
+        list.clamp_selection();
+    }
+
+    /// Drain finished background `gh` jobs into the list and session.
+    pub(crate) fn poll_pr_events(&mut self) {
+        while let Ok(event) = self.pr_rx.try_recv() {
+            match event {
+                PrEvent::Accounts(result) => {
+                    self.list_mut().accounts = match result {
+                        Ok(accounts) => Load::Ready(accounts),
+                        Err(e) => Load::Failed(e),
+                    };
+                    self.start_list_queries();
+                }
+                PrEvent::List { key, result } => {
+                    let list = self.list_mut();
+                    list.results.insert(
+                        key,
+                        match result {
+                            Ok(prs) => Load::Ready(prs),
+                            Err(e) => Load::Failed(e),
+                        },
+                    );
+                    list.clamp_selection();
+                }
+                PrEvent::Session { generation, result } => {
+                    let tx = self.pr_tx.clone();
+                    let local = self.repo.clone();
+                    let selected_path = self.files.get(self.selected).map(|e| e.path.clone());
+                    let Some(session) = self.pr.as_mut().filter(|s| s.generation == generation)
+                    else {
+                        continue;
+                    };
+                    match result {
+                        Ok(details) => {
+                            // A refresh keeps the selected file when it's still there.
+                            let idx = selected_path
+                                .and_then(|p| details.files.iter().position(|f| f.entry.path == p))
+                                .unwrap_or(0);
+                            let old_head = session.details().map(|d| d.head_sha.clone());
+                            let new_head = details.head_sha.clone();
+                            let dropped = session.set_details(details, tx, local);
+                            self.selected = idx;
+                            self.changed_lines = None;
+                            self.reload();
+                            // Reviews are pinned to the head that was loaded;
+                            // make a moved head visible before anyone approves.
+                            if old_head.is_some_and(|h| h != new_head) {
+                                let mut msg = format!(
+                                    "PR head moved to {} — re-check before submitting",
+                                    &new_head[..new_head.len().min(7)]
+                                );
+                                if dropped > 0 {
+                                    msg.push_str(&format!(
+                                        "; {dropped} draft(s) on lines no longer in the diff dropped"
+                                    ));
+                                }
+                                self.set_status(msg);
+                            }
+                        }
+                        Err(e) => {
+                            // A failed refresh keeps the files already loaded.
+                            if session.details().is_none() {
+                                session.details = Load::Failed(e.clone());
+                            }
+                            self.diff_loading = false;
+                            self.set_status(format!("error: {e}"));
+                        }
+                    }
+                }
+                PrEvent::File {
+                    generation,
+                    path,
+                    result,
+                } => {
+                    let Some(session) = self.pr.as_mut().filter(|s| s.generation == generation)
+                    else {
+                        continue;
+                    };
+                    let current = self
+                        .files
+                        .get(self.selected)
+                        .filter(|e| e.path == path && self.diff_loading)
+                        .cloned();
+                    match result {
+                        Ok((old, new)) => {
+                            session.contents.insert(path, (old.clone(), new.clone()));
+                            if let Some(entry) = current {
+                                self.show_versions(&entry, old, new);
+                            }
+                        }
+                        Err(e) => {
+                            if current.is_some() {
+                                self.diff_loading = false;
+                                self.set_status(format!("error: {e}"));
+                            }
+                        }
+                    }
+                }
+                PrEvent::Submitted {
+                    generation,
+                    event,
+                    result,
+                } => {
+                    if self.pr.as_ref().map(|s| s.generation) != Some(generation) {
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => {
+                            self.review_modal = None;
+                            if let Some(session) = self.pr.as_mut() {
+                                session.drafts.clear();
+                            }
+                            // The PR may have moved between tabs (e.g. out of
+                            // review requested); re-run searches next visit.
+                            if let Some(list) = self.pr_list.as_mut() {
+                                list.invalidate(None);
+                            }
+                            self.set_status(format!("review submitted: {}", event.label()));
+                        }
+                        Err(e) => match self.review_modal.as_mut() {
+                            Some(modal) => {
+                                modal.submitting = false;
+                                modal.error = Some(e);
+                            }
+                            None => self.set_status(format!("review failed: {e}")),
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    /// With unsent draft comments, the first call arms a confirmation and
+    /// returns false; the repeated (armed) call goes through.
+    fn confirm_discard(&mut self, armed: bool) -> bool {
+        let drafts = self.pr.as_ref().map_or(0, |s| s.drafts.len());
+        if drafts == 0 || armed {
+            return true;
+        }
+        self.discard_armed = true;
+        self.set_status(format!(
+            "{drafts} unsent draft comment(s) — press again to discard"
+        ));
+        false
+    }
+
+    fn request_quit(&mut self, armed: bool) {
+        if self.confirm_discard(armed) {
+            self.quit = true;
+        }
+    }
+
+    /// Reset per-source view state when switching between the local
+    /// repository and a PR.
+    fn clear_view_state(&mut self) {
+        self.files.clear();
+        self.selected = 0;
+        self.file_scroll = None;
+        self.h_scroll_files = 0;
+        self.file_search = None;
+        self.search_input = None;
+        self.path_filter = None;
+        self.content_filter = None;
+        self.changed_lines = None;
+        self.comment_editor = None;
+        self.review_modal = None;
+        self.pr_info_scroll = None;
+        self.reload_diff();
+    }
+
+    /// Start reviewing the PR selected in the list.
+    fn open_selected_pr(&mut self, armed: bool) {
+        let Some((account, summary)) = self.pr_list.as_ref().and_then(|l| l.selected_row()) else {
+            return;
+        };
+        match &self.pr {
+            Some(session)
+                if session.summary.url == summary.url
+                    && session.account.host == account.host
+                    && session.account.login == account.login =>
+            {
+                // Same PR as the one under review: just go back to it.
+                self.pr_list_open = false;
+                return;
+            }
+            Some(_) => {
+                if !self.confirm_discard(armed) {
+                    return;
+                }
+            }
+            None => {
+                self.local_selected_path = self.files.get(self.selected).map(|e| e.path.clone());
+            }
+        }
+        self.pr_generation += 1;
+        pr::spawn_session(
+            self.pr_tx.clone(),
+            self.pr_generation,
+            account.clone(),
+            summary.repo.clone(),
+            summary.number,
+        );
+        self.pr = Some(pr::PrSession::new(self.pr_generation, account, summary));
+        self.pr_list_open = false;
+        self.clear_view_state();
+        self.diff_loading = true;
+    }
+
+    /// Stop reviewing and return to the PR list (the local diff is
+    /// reloaded behind it).
+    fn leave_pr(&mut self, armed: bool) {
+        if !self.confirm_discard(armed) {
+            return;
+        }
+        self.pr = None;
+        self.clear_view_state();
+        self.reload();
+        if let Some(path) = self.local_selected_path.take() {
+            if let Some(idx) = self.files.iter().position(|e| e.path == path) {
+                self.selected = idx;
+                self.reload_diff();
+            }
+        }
+        self.open_pr_list();
+    }
+
+    /// Re-fetch the PR under review (new commits, changed files). Drafts
+    /// are kept.
+    fn refresh_pr(&mut self) {
+        let Some(session) = self.pr.as_mut() else {
+            return;
+        };
+        // New generation: in-flight results for the old head are dropped.
+        self.pr_generation += 1;
+        session.generation = self.pr_generation;
+        pr::spawn_session(
+            self.pr_tx.clone(),
+            session.generation,
+            session.account.clone(),
+            session.summary.repo.clone(),
+            session.summary.number,
+        );
+        self.set_status("refreshing PR…");
+    }
+
+    /// Open the selected list PR, or the one under review, in the browser.
+    fn open_in_browser(&mut self) {
+        let target = if self.pr_list_open {
+            self.pr_list.as_ref().and_then(|l| l.selected_row())
+        } else {
+            self.pr
+                .as_ref()
+                .map(|s| (s.account.clone(), s.summary.clone()))
+        };
+        let Some((account, summary)) = target else {
+            return;
+        };
+        match gh::open_in_browser(&account, &summary.url) {
+            Ok(()) => self.set_status(format!("opened {}#{}", summary.repo, summary.number)),
+            Err(e) => self.set_status(format!("error: {e}")),
+        }
+    }
+
+    fn handle_pr_list_key(&mut self, code: KeyCode, modifiers: KeyModifiers, armed: bool) {
+        let list = self.list_mut();
+        if let Some(input) = list.filter_input.as_mut() {
+            match code {
+                KeyCode::Esc => {
+                    list.filter_input = None;
+                    list.text_filter = None;
+                }
+                KeyCode::Enter => {
+                    let query = list.filter_input.take().unwrap_or_default();
+                    list.text_filter = (!query.is_empty()).then_some(query);
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                    input.push(c);
+                    list.selected = 0;
+                }
+                _ => {}
+            }
+            list.clamp_selection();
+            return;
+        }
+
+        let len = list.rows().len();
+        let page = (list.view_area.height as usize).max(1);
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                list.selected = (list.selected + 1).min(len.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => list.selected = list.selected.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => list.selected = 0,
+            KeyCode::Char('G') | KeyCode::End => list.selected = len.saturating_sub(1),
+            KeyCode::PageDown => {
+                list.selected = (list.selected + page).min(len.saturating_sub(1));
+            }
+            KeyCode::PageUp => list.selected = list.selected.saturating_sub(page),
+            KeyCode::Tab | KeyCode::BackTab => {
+                list.tab = list.tab.cycle(code == KeyCode::Tab);
+                list.selected = 0;
+                self.start_list_queries();
+            }
+            KeyCode::Char(c @ '1'..='4') => {
+                list.tab = pr::PrTab::ALL[c as usize - '1' as usize];
+                list.selected = 0;
+                self.start_list_queries();
+            }
+            KeyCode::Char('a') => {
+                let n = list.account_list().len();
+                if n <= 1 {
+                    self.set_status("only one gh account is logged in");
+                    return;
+                }
+                list.account_filter = match list.account_filter {
+                    None => Some(0),
+                    Some(i) if i + 1 < n => Some(i + 1),
+                    Some(_) => None,
+                };
+                list.selected = 0;
+                self.start_list_queries();
+            }
+            KeyCode::Char('s') => {
+                list.state = list.state.next();
+                list.selected = 0;
+                self.start_list_queries();
+            }
+            KeyCode::Char('d') => {
+                list.hide_drafts = !list.hide_drafts;
+                list.clamp_selection();
+            }
+            KeyCode::Char('/') => {
+                list.filter_input = Some(list.text_filter.clone().unwrap_or_default());
+            }
+            KeyCode::Char('r') => {
+                list.invalidate(None);
+                if matches!(list.accounts, Load::Failed(_)) {
+                    list.accounts = Load::Loading;
+                    pr::spawn_accounts(self.pr_tx.clone());
+                }
+                self.start_list_queries();
+                self.set_status("refreshing…");
+            }
+            KeyCode::Char('o') => self.open_in_browser(),
+            KeyCode::Enter => self.open_selected_pr(armed),
+            KeyCode::Esc => {
+                if list.text_filter.take().is_some() {
+                    list.clamp_selection();
+                } else {
+                    self.pr_list_open = false;
+                    // Nothing to go back to outside a repository.
+                    if self.pr.is_none() && self.repo.is_none() {
+                        self.quit = true;
+                    }
+                }
+            }
+            KeyCode::Char('q') => self.request_quit(armed),
+            _ => {}
+        }
+    }
+
+    fn handle_pr_list_mouse(&mut self, mouse: MouseEvent) {
+        let list = self.list_mut();
+        let len = list.rows().len();
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                list.selected = (list.selected + 3).min(len.saturating_sub(1));
+            }
+            MouseEventKind::ScrollUp => list.selected = list.selected.saturating_sub(3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let area = list.view_area;
+                if area.contains(Position::new(mouse.column, mouse.row)) {
+                    let idx = list.view_offset + (mouse.row - area.y) as usize;
+                    if idx < len {
+                        list.selected = idx;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// PR-review-only bindings; returns true when the key was handled.
+    fn handle_pr_review_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('J') => self.move_cursor(true),
+            KeyCode::Char('K') => self.move_cursor(false),
+            KeyCode::Char('a') => self.open_comment_editor(Side::Right),
+            KeyCode::Char('A') => self.open_comment_editor(Side::Left),
+            KeyCode::Char('x') => self.delete_drafts_at_cursor(),
+            KeyCode::Char('R') => self.open_review_modal(),
+            KeyCode::Char('i') => self.pr_info_scroll = Some(0),
+            KeyCode::Char('o') => self.open_in_browser(),
+            KeyCode::Char('r') => self.refresh_pr(),
+            KeyCode::Char('m') | KeyCode::Char('b') => {
+                self.set_status("not available while reviewing a PR");
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether aligned row `i` is drawn in at least one visible pane.
+    fn row_visible(&self, i: usize) -> bool {
+        let Some(row) = self.diff.rows.get(i) else {
+            return false;
+        };
+        !self.compact
+            || (self.show_old && row.left.is_some())
+            || (self.show_new && row.right.is_some())
+    }
+
+    /// `row_to_scroll` for every aligned row, in one pass.
+    fn scroll_positions(&self) -> Vec<usize> {
+        let (mut left, mut right) = (0usize, 0usize);
+        let mut out = Vec::with_capacity(self.diff.rows.len());
+        for (i, row) in self.diff.rows.iter().enumerate() {
+            out.push(if !self.compact {
+                i
+            } else {
+                match (self.show_old, self.show_new) {
+                    (true, false) => left,
+                    (false, true) => right,
+                    _ => left.min(right),
+                }
+            });
+            left += row.left.is_some() as usize;
+            right += row.right.is_some() as usize;
+        }
+        out
+    }
+
+    /// Move the comment cursor to the next/previous visible row and
+    /// scroll it into view.
+    fn move_cursor(&mut self, forward: bool) {
+        let n = self.diff.rows.len();
+        let mut i = self.cursor.min(n.saturating_sub(1));
+        loop {
+            let next = match (forward, i.checked_sub(1)) {
+                (true, _) => i + 1,
+                (false, Some(prev)) => prev,
+                (false, None) => break,
+            };
+            if next >= n {
+                break;
+            }
+            i = next;
+            if self.row_visible(i) {
+                self.cursor = i;
+                break;
+            }
+        }
+        let pos = self.row_to_scroll(self.cursor.min(n));
+        let height = self.diff_height.max(1);
+        if pos < self.scroll {
+            self.scroll = pos;
+        } else if pos >= self.scroll + height {
+            self.scroll = pos + 1 - height;
+        }
+        self.clamp_scroll();
+    }
+
+    /// Keep the comment cursor on screen after the view scrolled.
+    fn clamp_cursor_to_view(&mut self) {
+        let n = self.diff.rows.len();
+        if n == 0 {
+            self.cursor = 0;
+            return;
+        }
+        self.cursor = self.cursor.min(n - 1);
+        let positions = self.scroll_positions();
+        let (top, height) = (self.scroll, self.diff_height.max(1));
+        let pos = positions[self.cursor];
+        if pos >= top && pos < top + height && self.row_visible(self.cursor) {
+            return;
+        }
+        let target = if pos < top {
+            (0..n).find(|&i| self.row_visible(i) && positions[i] >= top)
+        } else {
+            (0..n).rev().find(|&i| self.row_visible(i) && positions[i] < top + height)
+        };
+        if let Some(i) = target {
+            self.cursor = i;
+        }
+    }
+
+    /// Put the comment cursor on the diff row clicked in one pane.
+    fn click_diff_row(&mut self, row: u16, left: bool) {
+        let area = if left { self.old_pane_area } else { self.new_pane_area };
+        let Some(offset) = row.checked_sub(area.y) else {
+            return;
+        };
+        let visible = self.scroll + offset as usize;
+        let idx = if self.compact {
+            self.diff
+                .rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| if left { r.left.is_some() } else { r.right.is_some() })
+                .nth(visible)
+                .map(|(i, _)| i)
+        } else {
+            (visible < self.diff.rows.len()).then_some(visible)
+        };
+        if let Some(i) = idx {
+            self.cursor = i;
+        }
+    }
+
+    /// Open the inline comment editor on the cursor row: the new side
+    /// for `Side::Right` (old side for pure removals), the old side for
+    /// `Side::Left` (new side for pure additions).
+    fn open_comment_editor(&mut self, prefer: Side) {
+        let editor = (|| {
+            let session = self.pr.as_ref()?;
+            let entry = self.files.get(self.selected)?;
+            let row = self.diff.rows.get(self.cursor)?;
+            let left = row.left.as_ref().map(|c| (Side::Left, c.line_no));
+            let right = row.right.as_ref().map(|c| (Side::Right, c.line_no));
+            let (side, line) = match prefer {
+                Side::Right => right.or(left),
+                Side::Left => left.or(right),
+            }?;
+            let file = session.file(&entry.path)?;
+            if file.patch.is_none() {
+                return Some(Err(
+                    "GitHub has no diff for this file (too large); inline comments unavailable"
+                        .to_string(),
+                ));
+            }
+            if !file.commentable.contains(&(side, line)) {
+                return Some(Err(format!(
+                    "line {line} is outside the PR's diff hunks — GitHub only accepts comments on changed lines and nearby context"
+                )));
+            }
+            let text = session
+                .draft_at(&entry.path, side, line)
+                .map(|i| session.drafts[i].body.clone())
+                .unwrap_or_default();
+            Some(Ok(pr::CommentEditor {
+                path: entry.path.clone(),
+                side,
+                line,
+                buffer: pr::TextBuffer { text },
+            }))
+        })();
+        match editor {
+            Some(Ok(editor)) => self.comment_editor = Some(editor),
+            Some(Err(msg)) => self.set_status(msg),
+            None => self.set_status("no line to comment on"),
+        }
+    }
+
+    fn handle_comment_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        match code {
+            KeyCode::Esc => self.comment_editor = None,
+            KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => self.save_comment(),
+            _ => {
+                if let Some(editor) = self.comment_editor.as_mut() {
+                    edit_text(&mut editor.buffer, code, modifiers);
+                }
+            }
+        }
+    }
+
+    /// Store the edited comment as a draft; an emptied draft is removed.
+    fn save_comment(&mut self) {
+        let Some(editor) = self.comment_editor.take() else {
+            return;
+        };
+        let Some(session) = self.pr.as_mut() else {
+            return;
+        };
+        let body = editor.buffer.text.trim_end().to_string();
+        let msg = match (session.draft_at(&editor.path, editor.side, editor.line), body.is_empty()) {
+            (Some(i), true) => {
+                session.drafts.remove(i);
+                "draft comment removed"
+            }
+            (Some(i), false) => {
+                session.drafts[i].body = body;
+                "draft comment updated"
+            }
+            (None, true) => return,
+            (None, false) => {
+                session.drafts.push(gh::DraftComment {
+                    path: editor.path,
+                    side: editor.side,
+                    line: editor.line,
+                    body,
+                });
+                "draft comment added — R to submit the review"
+            }
+        };
+        self.set_status(msg);
+    }
+
+    /// Drop the draft comments on either side of the cursor row.
+    fn delete_drafts_at_cursor(&mut self) {
+        let (Some(session), Some(entry), Some(row)) = (
+            self.pr.as_mut(),
+            self.files.get(self.selected),
+            self.diff.rows.get(self.cursor),
+        ) else {
+            return;
+        };
+        let left = row.left.as_ref().map(|c| c.line_no);
+        let right = row.right.as_ref().map(|c| c.line_no);
+        let before = session.drafts.len();
+        session.drafts.retain(|d| {
+            d.path != entry.path
+                || match d.side {
+                    Side::Left => Some(d.line) != left,
+                    Side::Right => Some(d.line) != right,
+                }
+        });
+        let removed = before - session.drafts.len();
+        self.set_status(if removed == 0 {
+            "no draft comment on this line".to_string()
+        } else {
+            format!("removed {removed} draft comment(s)")
+        });
+    }
+
+    fn open_review_modal(&mut self) {
+        let Some(session) = &self.pr else {
+            return;
+        };
+        if session.details().is_none() {
+            self.set_status("PR is still loading");
+            return;
+        }
+        self.review_modal = Some(pr::ReviewModal::new(!session.is_own()));
+    }
+
+    fn handle_review_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        let Some(modal) = self.review_modal.as_mut() else {
+            return;
+        };
+        if modal.submitting {
+            return;
+        }
+        match code {
+            KeyCode::Esc => self.review_modal = None,
+            KeyCode::Tab => modal.cycle_event(true),
+            KeyCode::BackTab => modal.cycle_event(false),
+            KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => self.submit_review(),
+            _ => edit_text(&mut modal.buffer, code, modifiers),
+        }
+    }
+
+    fn submit_review(&mut self) {
+        let (Some(session), Some(modal)) = (self.pr.as_ref(), self.review_modal.as_mut()) else {
+            return;
+        };
+        let Some(details) = session.details() else {
+            return;
+        };
+        if let Some(problem) = modal.validate(session.drafts.len()) {
+            modal.error = Some(problem.to_string());
+            return;
+        }
+        modal.submitting = true;
+        modal.error = None;
+        pr::spawn_submit(
+            self.pr_tx.clone(),
+            session,
+            details.head_sha.clone(),
+            modal.event,
+            modal.buffer.text.clone(),
+        );
+    }
+
+    fn handle_info_key(&mut self, code: KeyCode) {
+        let Some(scroll) = self.pr_info_scroll.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => self.pr_info_scroll = None,
+            _ => {}
+        }
+    }
+
+    /// Placeholder for an empty diff pane: loading, load failure, or no diff.
+    pub(crate) fn diff_placeholder(&self) -> String {
+        if self.diff_loading {
+            return "(loading…)".to_string();
+        }
+        match self.pr.as_ref().map(|s| &s.details) {
+            Some(Load::Failed(e)) => format!("(failed to load PR: {e})"),
+            _ => "(no textual diff)".to_string(),
+        }
+    }
+
+    /// Whether a draft comment sits on `side`/`line` of the selected file.
+    pub(crate) fn has_draft(&self, side: Side, line: usize) -> bool {
+        match (&self.pr, self.files.get(self.selected)) {
+            (Some(session), Some(entry)) => session.draft_at(&entry.path, side, line).is_some(),
+            _ => false,
+        }
+    }
+}
+
+/// Apply a key to a modal text buffer: printable characters and Enter
+/// (newline) append, Backspace deletes the last character.
+fn edit_text(buffer: &mut pr::TextBuffer, code: KeyCode, modifiers: KeyModifiers) {
+    match code {
+        KeyCode::Enter => buffer.text.push('\n'),
+        KeyCode::Backspace => {
+            buffer.text.pop();
+        }
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => buffer.text.push(c),
+        _ => {}
     }
 }
 
@@ -1153,9 +2063,18 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(repo: GitRepo, mode: DiffMode, config: config::Config) -> Result<()> {
+/// Run the TUI. `open_prs` starts on the pull request list.
+pub fn run(
+    repo: Option<GitRepo>,
+    mode: DiffMode,
+    config: config::Config,
+    open_prs: bool,
+) -> Result<()> {
     let mut app = App::new(repo, mode, config);
     app.reload();
+    if open_prs || app.repo.is_none() {
+        app.open_pr_list();
+    }
 
     spawn_update_check(app.update_state.clone());
 
@@ -1265,6 +2184,7 @@ fn event_loop(
         app.expire_status();
         app.apply_highlight_results();
         app.poll_auto_refresh();
+        app.poll_pr_events();
 
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {

@@ -7,10 +7,15 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, FilePanelView};
+use crate::gh::Side;
 use crate::types::{FileStatus, RowKind};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    if app.pr_list_open {
+        crate::pr_ui::draw_pr_list(f, app, area);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -30,15 +35,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     if app.show_help {
-        draw_help(f, area);
+        draw_help(f, app, area);
     }
 
     if app.config_modal.is_some() {
         draw_config_modal(f, app, area);
     }
+
+    crate::pr_ui::draw_pr_overlays(f, app, area);
 }
 
 fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    if app.pr.is_some() {
+        crate::pr_ui::draw_review_status_bar(f, app, area);
+        return;
+    }
     let mut spans = vec![Span::raw(format!(
         " gispect | {} | mode: {} | base: {} | {} files changed",
         app.branch,
@@ -73,9 +84,14 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             format!(" {status}"),
             Style::default().fg(Color::Yellow),
         ))
+    } else if app.pr.is_some() {
+        Line::from(Span::styled(
+            " j/k files  J/K line  n/N change  a comment  R review  i info  Esc PR list  ? help",
+            Style::default().add_modifier(Modifier::DIM),
+        ))
     } else {
         Line::from(Span::styled(
-            " j/k files  J/K scroll  n/N change  / search  ? help  q quit",
+            " j/k files  J/K scroll  n/N change  / search  P PRs  ? help  q quit",
             Style::default().add_modifier(Modifier::DIM),
         ))
     };
@@ -258,7 +274,10 @@ fn list_rows(app: &App) -> Vec<FileRow<'static>> {
         .enumerate()
         .filter(|(i, _)| app.passes_filter(*i))
         .map(|(i, entry)| {
-            let mut spans = vec![marker_span(&entry.status), Span::raw(entry.path.clone())];
+            let mut spans = vec![
+                marker_span(&entry.status),
+                Span::raw(crate::gh::sanitize_line(&entry.path)),
+            ];
             spans.extend(count_spans(entry));
             FileRow {
                 file_idx: Some(i),
@@ -334,7 +353,10 @@ fn emit_tree(nodes: &[TreeNode], prefix: &str, app: &App, rows: &mut Vec<FileRow
                     file_idx: None,
                     spans: vec![
                         branch,
-                        Span::styled(format!("{name}/"), Style::default().fg(Color::Blue)),
+                        Span::styled(
+                            format!("{}/", crate::gh::sanitize_line(name)),
+                            Style::default().fg(Color::Blue),
+                        ),
                     ],
                 });
                 let child_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
@@ -342,7 +364,11 @@ fn emit_tree(nodes: &[TreeNode], prefix: &str, app: &App, rows: &mut Vec<FileRow
             }
             TreeNode::File { idx, name } => {
                 let entry = &app.files[*idx];
-                let mut spans = vec![branch, marker_span(&entry.status), Span::raw(name.clone())];
+                let mut spans = vec![
+                    branch,
+                    marker_span(&entry.status),
+                    Span::raw(crate::gh::sanitize_line(name)),
+                ];
                 spans.extend(count_spans(entry));
                 rows.push(FileRow {
                     file_idx: Some(*idx),
@@ -355,7 +381,7 @@ fn emit_tree(nodes: &[TreeNode], prefix: &str, app: &App, rows: &mut Vec<FileRow
 
 /// Compute a scroll offset that keeps `selected` visible within a list of
 /// `total` items rendered in a viewport of `height` rows.
-fn window_offset(selected: usize, total: usize, height: usize) -> usize {
+pub(crate) fn window_offset(selected: usize, total: usize, height: usize) -> usize {
     if height == 0 || total <= height {
         return 0;
     }
@@ -372,8 +398,8 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
     // With the file list hidden, show the selected path in the pane title
     // so the user keeps their bearings.
     let title = match (is_left, app.show_files, app.files.get(app.selected)) {
-        (true, false, Some(e)) => format!("Old [1] — {}", e.path),
-        (false, false, Some(e)) => format!("New [2] — {}", e.path),
+        (true, false, Some(e)) => format!("Old [1] — {}", crate::gh::sanitize_line(&e.path)),
+        (false, false, Some(e)) => format!("New [2] — {}", crate::gh::sanitize_line(&e.path)),
         (true, ..) => "Old [1]".to_string(),
         (false, ..) => "New [2]".to_string(),
     };
@@ -389,7 +415,7 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
     }
 
     if app.diff.rows.is_empty() {
-        let msg = Paragraph::new("(no textual diff)")
+        let msg = Paragraph::new(app.diff_placeholder())
             .style(Style::default().add_modifier(Modifier::DIM))
             .alignment(ratatui::layout::Alignment::Center);
         let centered = center_vertically(inner, 1);
@@ -438,6 +464,18 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
                         Span::styled("M ", Style::default().fg(Color::Yellow))
                     }
                     _ => Span::raw("  "),
+                };
+                // A pending review comment on this line shows as a dot
+                // next to the status letter.
+                let side = if is_left { Side::Left } else { Side::Right };
+                let marker = if app.has_draft(side, c.line_no) {
+                    let letter = marker.content.chars().next().unwrap_or(' ');
+                    Span::styled(
+                        format!("{letter}●"),
+                        marker.style.fg(Color::Magenta),
+                    )
+                } else {
+                    marker
                 };
 
                 // Base segments: syntax-highlighted spans when enabled and
@@ -543,14 +581,17 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
             None => segments,
         };
 
-        let content_width = width.saturating_sub(line_no_str.len() + marker.content.len());
+        let content_width = width.saturating_sub(line_no_str.len() + marker.width());
         let h_scroll = if is_left { app.h_scroll_old } else { app.h_scroll_new };
         let sliced = slice_segments(&segments, h_scroll, content_width);
 
-        let mut spans = vec![
-            Span::styled(line_no_str, Style::default().add_modifier(Modifier::DIM)),
-            marker,
-        ];
+        // The PR review comment cursor shows as an inverted line number.
+        let line_no_style = if app.pr.is_some() && *row_idx == app.cursor {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        let mut spans = vec![Span::styled(line_no_str, line_no_style), marker];
         spans.extend(sliced.into_iter().map(|(style, text)| Span::styled(text, style)));
 
         lines.push(Line::from(spans));
@@ -562,7 +603,11 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
 /// Skip `skip` characters and keep at most `take` characters across a
 /// sequence of styled segments, preserving per-segment styles and staying
 /// char-boundary-safe.
-fn slice_segments(segments: &[(Style, String)], skip: usize, take: usize) -> Vec<(Style, String)> {
+pub(crate) fn slice_segments(
+    segments: &[(Style, String)],
+    skip: usize,
+    take: usize,
+) -> Vec<(Style, String)> {
     let mut skip_remaining = skip;
     let mut take_remaining = take;
     let mut result = Vec::new();
@@ -665,16 +710,8 @@ fn center_vertically(area: Rect, content_height: u16) -> Rect {
     }
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
-    let width = 52u16.min(area.width);
-    let height = 31u16.min(area.height);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let popup = Rect { x, y, width, height };
-
-    f.render_widget(Clear, popup);
-
-    let text = vec![
+fn draw_help(f: &mut Frame, app: &App, area: Rect) {
+    let mut text = vec![
         Line::from("gispect — key bindings"),
         Line::from(""),
         Line::from("j / Down     next file"),
@@ -702,8 +739,31 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("b            cycle base branch"),
         Line::from("r            reload"),
         Line::from("U            apply update & restart"),
+        Line::from("P            pull requests (gh accounts)"),
         Line::from("? / Esc      toggle this help / quit"),
     ];
+    if app.pr.is_some() {
+        text.extend([
+            Line::from(""),
+            Line::from("PR review"),
+            Line::from("J / K        move line cursor (click sets it)"),
+            Line::from("a / A        comment on new / old side of line"),
+            Line::from("x            delete draft comment(s) on line"),
+            Line::from("R            submit review (verdict + drafts)"),
+            Line::from("i            PR description"),
+            Line::from("o            open PR in browser"),
+            Line::from("r            re-fetch PR"),
+            Line::from("Esc          back to PR list"),
+        ]);
+    }
+
+    let width = 52u16.min(area.width);
+    let height = (text.len() as u16 + 2).min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect { x, y, width, height };
+
+    f.render_widget(Clear, popup);
 
     let block = Block::default().borders(Borders::ALL).title("Help");
     let para = Paragraph::new(text).block(block);

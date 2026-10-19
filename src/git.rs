@@ -221,6 +221,13 @@ impl GitRepo {
         self.git_opt(&["show", &format!("{rev}:{path}")])
     }
 
+    /// Contents of `path` at commit `sha`, if that commit exists locally
+    /// (e.g. a PR already fetched into this clone).
+    pub fn show_at(&self, sha: &str, path: &str) -> Option<String> {
+        self.git_opt(&["cat-file", "-e", &format!("{sha}^{{commit}}")])?;
+        self.show(sha, path)
+    }
+
     /// (old_content, new_content) of `entry` for `mode`. Missing sides
     /// degrade to "" (e.g. added/deleted files); binary entries return
     /// ("", "") immediately.

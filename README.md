@@ -25,6 +25,7 @@ gispect --base develop  # choose the base branch
 gispect --repo ~/src/x  # inspect another repository
 gispect update          # check upstream for new commits and reinstall
 gispect mcp             # run as an MCP server over stdio
+gispect prs             # pull request view: review requests and your PRs
 ```
 
 ## Diff modes
@@ -57,6 +58,7 @@ Cycle with `m`:
 | `p` | filter the file panel by file/folder name |
 | `C` | open config (startup defaults) |
 | `U` | apply available update and restart into the new version |
+| `P` | pull request view (PRs across logged-in gh accounts) |
 | `?` | help overlay |
 | `q` / `Esc` | quit |
 
@@ -114,6 +116,82 @@ persisted (it is repo-specific).
 - All searches are smart-case: an all-lowercase query matches
   case-insensitively, while a query containing an uppercase letter matches
   case-sensitively.
+
+## Pull requests
+
+`P` (or `gispect prs`) opens the PR list. `gispect prs` also works outside a
+git repository. Requires the GitHub CLI (`gh`) logged in (`gh auth login`).
+
+It lists PRs for every account `gh` is logged in to, across hosts (github.com
+and GitHub Enterprise). Each request runs as that account by passing its token
+to `gh` through the environment, so the active `gh` account is never switched.
+
+Tabs: Review requested (`review-requested:@me`), Authored, Assigned, Involved.
+Results are the 50 most recently updated per account and tab, cached until
+refreshed. Rows show state (● open/merged/closed, ◌ draft), `repo#number`,
+title, account (when more than one), author, `+added -removed`, review
+decision and age.
+
+| Key | Action |
+|---|---|
+| `j` / `k`, `↓` / `↑` | select |
+| `g` / `G` | top / bottom |
+| `Tab` / `Shift-Tab`, `1`–`4` | switch tab |
+| `a` | cycle account filter (all / one account) |
+| `s` | cycle state (open / closed / merged / all) |
+| `d` | hide / show drafts |
+| `/` | text filter over title, repo, author, branch and `#number` (smart-case, live; `Enter` keeps, `Esc` clears) |
+| `r` | refresh |
+| `o` | open in browser |
+| `Enter` | review the selected PR |
+| `Esc` | back (clears the filter first) |
+| `q` | quit |
+
+Mouse: wheel moves the selection, click selects.
+
+### Reviewing
+
+`Enter` opens the PR in the normal side-by-side view, comparing the merge base
+with the PR head, exactly like GitHub's "Files changed". File contents load on
+demand (from the local clone when it already has the commits, else from the
+GitHub API). Search, filters, compact view, syntax highlighting and hunk
+navigation all work as usual; `m` and `b` are disabled.
+
+| Key | Action |
+|---|---|
+| `J` / `K` | move the line cursor (shown as an inverted line number; mouse click also sets it) |
+| `a` | comment on the new side of the cursor line (old side for removed lines) |
+| `A` | comment on the old side |
+| `x` | delete draft comments on the cursor line |
+| `R` | submit review |
+| `i` | PR description |
+| `o` | open in browser |
+| `r` | re-fetch the PR (drafts kept) |
+| `Esc` | back to the PR list |
+
+Comments are drafts until the review is submitted; lines with a draft show `●`
+in the gutter and the status bar shows the draft count. GitHub only accepts
+inline comments on lines inside the diff hunks (changed lines plus surrounding
+context); other lines are refused with a message. Pressing `a` on a line that
+already has a draft edits it; saving it empty removes it.
+
+Comment editor: type to write, `Enter` newline, `Backspace` delete, `Ctrl-S`
+save draft, `Esc` cancel.
+
+Review modal: `Tab` / `Shift-Tab` choose the verdict (Comment / Approve /
+Request changes), type a summary, `Ctrl-S` submit, `Esc` cancel. Approve and
+Request changes are unavailable on your own PR. Request changes needs a
+summary; Comment needs a summary or at least one inline comment. All drafts go
+out in one review, pinned to the head commit that was reviewed. On failure the
+modal stays open with GitHub's error and the drafts are kept.
+
+Leaving a PR or quitting with unsent drafts asks for confirmation (press the
+key again to discard).
+
+Text from GitHub (titles, descriptions, file names, file contents) has
+terminal control characters and Unicode bidi overrides replaced with `�` before
+display, so a PR can't inject escape sequences and "Trojan Source" characters
+stay visible.
 
 ## MCP server
 
