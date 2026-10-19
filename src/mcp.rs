@@ -8,11 +8,11 @@ use std::io::{self, BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::git::GitRepo;
+use crate::workspace::Workspace;
 use crate::types::{DiffMode, FileEntry, FileStatus};
 
 /// Run the MCP server, blocking on stdin until EOF.
-pub fn run(repo: GitRepo) -> anyhow::Result<()> {
+pub fn run(repo: Workspace) -> anyhow::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -45,7 +45,7 @@ pub fn run(repo: GitRepo) -> anyhow::Result<()> {
 
 /// Handle a single parsed JSON-RPC request, returning the response line to
 /// write (already serialized), or `None` for notifications (no `id`).
-fn handle_request(repo: &GitRepo, request: &Value) -> Option<String> {
+fn handle_request(repo: &Workspace, request: &Value) -> Option<String> {
     let id = request.get("id").cloned();
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request.get("params").cloned().unwrap_or(Value::Null);
@@ -110,7 +110,7 @@ fn handle_tools_list() -> Value {
         .expect("object")
         .insert(
             "path".to_string(),
-            json!({"type": "string", "description": "Path (relative to the repo root) of the file to diff."}),
+            json!({"type": "string", "description": "Path (relative to the repo root; prefixed with the repository folder, e.g. \"repo/src/x.rs\", when serving several repositories) of the file to diff."}),
         );
 
     json!({
@@ -145,7 +145,7 @@ fn handle_tools_list() -> Value {
 }
 
 /// Parse `mode`/`base` arguments into a [`DiffMode`].
-fn parse_mode(repo: &GitRepo, arguments: &Value) -> Result<DiffMode, String> {
+fn parse_mode(repo: &Workspace, arguments: &Value) -> Result<DiffMode, String> {
     let mode = arguments
         .get("mode")
         .and_then(Value::as_str)
@@ -198,7 +198,7 @@ fn tool_text_result(text: String, is_error: bool) -> Value {
     })
 }
 
-fn handle_tools_call(repo: &GitRepo, params: &Value) -> Result<Value, (i64, String)> {
+fn handle_tools_call(repo: &Workspace, params: &Value) -> Result<Value, (i64, String)> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -213,7 +213,7 @@ fn handle_tools_call(repo: &GitRepo, params: &Value) -> Result<Value, (i64, Stri
     }
 }
 
-fn run_list_changed_files(repo: &GitRepo, arguments: &Value) -> Value {
+fn run_list_changed_files(repo: &Workspace, arguments: &Value) -> Value {
     let mode = match parse_mode(repo, arguments) {
         Ok(mode) => mode,
         Err(err) => return tool_text_result(err, true),
@@ -230,7 +230,7 @@ fn run_list_changed_files(repo: &GitRepo, arguments: &Value) -> Value {
     }
 }
 
-fn run_get_file_diff(repo: &GitRepo, arguments: &Value) -> Value {
+fn run_get_file_diff(repo: &Workspace, arguments: &Value) -> Value {
     let mode = match parse_mode(repo, arguments) {
         Ok(mode) => mode,
         Err(err) => return tool_text_result(err, true),
@@ -241,13 +241,13 @@ fn run_get_file_diff(repo: &GitRepo, arguments: &Value) -> Value {
         None => return tool_text_result("missing required param: path".to_string(), true),
     };
 
-    match repo.unified_diff(&mode, Some(path)) {
+    match repo.unified_diff(&mode, path) {
         Ok(diff) => tool_text_result(diff, false),
         Err(err) => tool_text_result(err.to_string(), true),
     }
 }
 
-fn run_diff_summary(repo: &GitRepo, arguments: &Value) -> Value {
+fn run_diff_summary(repo: &Workspace, arguments: &Value) -> Value {
     let mode = match parse_mode(repo, arguments) {
         Ok(mode) => mode,
         Err(err) => return tool_text_result(err, true),

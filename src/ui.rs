@@ -50,9 +50,19 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
         crate::pr_ui::draw_review_status_bar(f, app, area);
         return;
     }
+    // Multi-repo: also name the selected file's repository and branch.
+    let branch = match app
+        .workspace
+        .as_ref()
+        .zip(app.files.get(app.selected))
+        .and_then(|(ws, entry)| ws.repo_label(&entry.path))
+    {
+        Some(label) => format!("{} | {}", app.branch, label),
+        None => app.branch.clone(),
+    };
     let mut spans = vec![Span::raw(format!(
         " gispect | {} | mode: {} | base: {} | {} files changed",
-        app.branch,
+        branch,
         app.mode.label(),
         app.base,
         app.files.len()

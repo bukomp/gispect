@@ -87,18 +87,26 @@ impl GitRepo {
     /// branch.
     pub fn default_base(&self) -> String {
         for candidate in ["main", "master"] {
-            let ok = Command::new("git")
-                .arg("-C")
-                .arg(&self.root)
-                .args(["rev-parse", "--verify", "--quiet", candidate])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if ok {
+            if self.has_ref(candidate) {
                 return candidate.to_string();
             }
         }
         self.current_branch()
+    }
+
+    /// Whether `name` resolves to an object (branch, tag, commit).
+    pub fn has_ref(&self, name: &str) -> bool {
+        // Never let a name be parsed as an option.
+        if name.starts_with('-') {
+            return false;
+        }
+        Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(["rev-parse", "--verify", "--quiet", name])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     /// All local branches, sorted.

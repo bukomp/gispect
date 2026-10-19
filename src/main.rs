@@ -12,12 +12,13 @@ mod search_ui;
 mod types;
 mod ui;
 mod update;
+mod workspace;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use crate::git::GitRepo;
 use crate::types::DiffMode;
+use crate::workspace::Workspace;
 
 #[derive(Parser)]
 #[command(name = "gispect", version, about = "Inspect git diffs in a side-by-side TUI")]
@@ -26,7 +27,8 @@ struct Cli {
     #[arg(short, long)]
     base: Option<String>,
 
-    /// Repository path (defaults to the current directory).
+    /// Repository path (defaults to the current directory). A folder that
+    /// is not inside a repository opens every repository directly under it.
     #[arg(short, long)]
     repo: Option<std::path::PathBuf>,
 
@@ -57,15 +59,15 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| std::env::current_dir().expect("cannot resolve cwd"));
     let open_prs = matches!(cli.command, Some(Command::Prs));
     // The PR view doesn't need a local repository; everything else does.
-    let repo = match GitRepo::discover(&path) {
-        Ok(repo) => Some(repo),
+    let repo = match Workspace::discover(&path) {
+        Ok(ws) => Some(ws),
         Err(_) if open_prs => None,
         Err(e) => return Err(e),
     };
     let base_flag = cli.base.is_some();
     let base = cli.base.unwrap_or_else(|| {
         repo.as_ref()
-            .map(GitRepo::default_base)
+            .map(Workspace::default_base)
             .unwrap_or_else(|| "main".to_string())
     });
     let config = config::Config::load();

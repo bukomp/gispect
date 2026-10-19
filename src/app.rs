@@ -21,7 +21,7 @@ use ratatui::Terminal;
 
 use crate::config;
 use crate::gh::{self, Side};
-use crate::git::GitRepo;
+use crate::workspace::Workspace;
 use crate::highlight::{self, HlLines};
 use crate::pr::{self, Load, PrEvent};
 use crate::search;
@@ -86,8 +86,9 @@ pub(crate) enum UpdateState {
 
 /// All state needed to render and drive the TUI.
 pub struct App {
-    /// Local repository; `None` when launched outside one (`gispect prs`).
-    pub(crate) repo: Option<GitRepo>,
+    /// Local repository (or repositories); `None` when launched outside
+    /// one (`gispect prs`).
+    pub(crate) workspace: Option<Workspace>,
     pub(crate) mode: DiffMode,
     pub(crate) base: String,
     pub(crate) branch: String,
@@ -207,21 +208,24 @@ pub struct App {
 }
 
 impl App {
-    fn new(repo: Option<GitRepo>, mode: DiffMode, config: config::Config) -> Self {
-        let base = match (&mode, &repo) {
+    fn new(workspace: Option<Workspace>, mode: DiffMode, config: config::Config) -> Self {
+        let base = match (&mode, &workspace) {
             (DiffMode::BranchToBase { base }, _) => base.clone(),
-            (_, Some(repo)) => repo.default_base(),
+            (_, Some(ws)) => ws.default_base(),
             (_, None) => "main".to_string(),
         };
-        let branch = repo.as_ref().map(GitRepo::current_branch).unwrap_or_default();
-        let base_choices = repo
+        let branch = workspace
             .as_ref()
-            .and_then(|r| r.local_branches().ok())
+            .map(Workspace::branch_label)
+            .unwrap_or_default();
+        let base_choices = workspace
+            .as_ref()
+            .and_then(|w| w.local_branches().ok())
             .unwrap_or_default();
         let (hl_jobs, hl_results) = spawn_highlight_worker();
         let repo_changed = Arc::new(AtomicBool::new(false));
-        if let Some(repo) = &repo {
-            spawn_repo_watcher(repo.clone(), repo_changed.clone());
+        if let Some(ws) = &workspace {
+            spawn_repo_watcher(ws.clone(), repo_changed.clone());
         }
         let (pr_tx, pr_rx) = mpsc::channel();
         let compact = config.compact;
@@ -237,7 +241,7 @@ impl App {
             (config.show_old, config.show_new)
         };
         App {
-            repo,
+            workspace,
             mode,
             base,
             branch,
@@ -330,12 +334,12 @@ impl App {
         if self.active_content_filter().is_some() {
             self.ensure_changed_lines();
         }
-        let files = match (&self.pr, &self.repo) {
+        let files = match (&self.pr, &self.workspace) {
             (Some(session), _) => Ok(session
                 .details()
                 .map(|d| d.files.iter().map(|f| f.entry.clone()).collect())
                 .unwrap_or_default()),
-            (None, Some(repo)) => repo.changed_files(&self.mode),
+            (None, Some(ws)) => ws.changed_files(&self.mode),
             (None, None) => Ok(Vec::new()),
         };
         match files {
@@ -398,8 +402,9 @@ impl App {
         }
     }
 
-    /// Parse changed lines for the current mode from one `git diff`,
-    /// unless already cached; needed while a content filter is in play.
+    /// Parse changed lines for the current mode from `git diff` (one per
+    /// repository), unless already cached; needed while a content filter
+    /// is in play.
     fn ensure_changed_lines(&mut self) {
         if self.changed_lines.is_some() {
             return;
@@ -428,12 +433,12 @@ impl App {
             self.changed_lines = Some(lines);
             return;
         }
-        let Some(repo) = &self.repo else {
+        let Some(ws) = &self.workspace else {
             self.changed_lines = Some(HashMap::new());
             return;
         };
-        match repo.unified_diff(&self.mode, None) {
-            Ok(diff) => self.changed_lines = Some(search::parse_changed_lines(&diff)),
+        match ws.changed_lines(&self.mode) {
+            Ok(lines) => self.changed_lines = Some(lines),
             Err(e) => {
                 self.changed_lines = Some(HashMap::new());
                 self.set_status(format!("error: {e}"));
@@ -478,7 +483,7 @@ impl App {
             self.set_status("binary file".to_string());
             return;
         }
-        let versions = match (&self.pr, &self.repo) {
+        let versions = match (&self.pr, &self.workspace) {
             (Some(session), _) => match session.contents.get(&entry.path) {
                 Some(v) => Ok(v.clone()),
                 None => {
@@ -488,7 +493,7 @@ impl App {
                     return;
                 }
             },
-            (None, Some(repo)) => repo.file_versions(&self.mode, &entry),
+            (None, Some(ws)) => ws.file_versions(&self.mode, &entry),
             (None, None) => return,
         };
         match versions {
@@ -564,7 +569,7 @@ impl App {
         if self.pr.is_some() || !self.repo_changed.swap(false, Ordering::Relaxed) {
             return;
         }
-        let Some(repo) = &self.repo else {
+        let Some(ws) = &self.workspace else {
             return;
         };
         let selected_path = self.files.get(self.selected).map(|e| e.path.clone());
@@ -572,7 +577,7 @@ impl App {
         let h_scroll_old = self.h_scroll_old;
         let h_scroll_new = self.h_scroll_new;
         let h_scroll_files = self.h_scroll_files;
-        match repo.changed_files(&self.mode) {
+        match ws.changed_files(&self.mode) {
             Ok(files) => self.files = files,
             // Transient failure (e.g. mid-rebase): keep the current view.
             Err(_) => return,
@@ -1356,7 +1361,10 @@ impl App {
                 }
                 PrEvent::Session { generation, result } => {
                     let tx = self.pr_tx.clone();
-                    let local = self.repo.clone();
+                    let local = match (&self.workspace, &self.pr) {
+                        (Some(ws), Some(session)) => ws.local_for(&session.summary.repo),
+                        _ => None,
+                    };
                     let selected_path = self.files.get(self.selected).map(|e| e.path.clone());
                     let Some(session) = self.pr.as_mut().filter(|s| s.generation == generation)
                     else {
@@ -1684,7 +1692,7 @@ impl App {
                 } else {
                     self.pr_list_open = false;
                     // Nothing to go back to outside a repository.
-                    if self.pr.is_none() && self.repo.is_none() {
+                    if self.pr.is_none() && self.workspace.is_none() {
                         self.quit = true;
                     }
                 }
@@ -2065,14 +2073,14 @@ impl Drop for TerminalGuard {
 
 /// Run the TUI. `open_prs` starts on the pull request list.
 pub fn run(
-    repo: Option<GitRepo>,
+    workspace: Option<Workspace>,
     mode: DiffMode,
     config: config::Config,
     open_prs: bool,
 ) -> Result<()> {
-    let mut app = App::new(repo, mode, config);
+    let mut app = App::new(workspace, mode, config);
     app.reload();
-    if open_prs || app.repo.is_none() {
+    if open_prs || app.workspace.is_none() {
         app.open_pr_list();
     }
 
@@ -2139,15 +2147,15 @@ fn spawn_highlight_worker() -> (mpsc::Sender<HlJob>, mpsc::Receiver<HlUpdate>) {
     (job_tx, res_rx)
 }
 
-/// Poll the repository fingerprint on a background thread and raise
+/// Poll the workspace fingerprint on a background thread and raise
 /// `flag` whenever it changes, so the UI auto-refreshes on external
 /// edits, commits, or staging. Exits with the process.
-fn spawn_repo_watcher(repo: GitRepo, flag: Arc<AtomicBool>) {
+fn spawn_repo_watcher(workspace: Workspace, flag: Arc<AtomicBool>) {
     std::thread::spawn(move || {
-        let mut last = repo.state_fingerprint();
+        let mut last = workspace.state_fingerprint();
         loop {
             std::thread::sleep(WATCH_INTERVAL);
-            let current = repo.state_fingerprint();
+            let current = workspace.state_fingerprint();
             if current != last {
                 last = current;
                 flag.store(true, Ordering::Relaxed);

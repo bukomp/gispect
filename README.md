@@ -23,10 +23,37 @@ runtime.
 gispect                 # TUI, comparing the current branch against main/master
 gispect --base develop  # choose the base branch
 gispect --repo ~/src/x  # inspect another repository
+gispect --repo ~/src    # inspect every repository directly under a folder
 gispect update          # check upstream for new commits and reinstall
 gispect mcp             # run as an MCP server over stdio
 gispect prs             # pull request view: review requests and your PRs
 ```
+
+## Multiple repositories
+
+When the start folder (the current directory or `--repo`) is not inside a git
+repository, gispect opens every repository directly under it (one level deep),
+for example a projects folder. Inside a repository, only that repository is
+used, as before.
+
+- Changed files from all repositories go into one list, each path prefixed
+  with its repository's folder name (`kanbu/src/main.rs`). The tree view (`t`)
+  groups them by repository.
+- The status bar shows the repository count, plus the repository and branch of
+  the selected file.
+- The default base is the one most repositories use (`main` or `master`). In
+  branch vs base mode, a repository that does not have the selected base
+  compares against its own default base instead. `b` cycles through the local
+  branches of all repositories.
+- Repositories that cannot be diffed (for example a repository with no
+  commits) are left out of the list.
+- All repositories are watched for changes, and searches and filters apply to
+  all of them.
+- When you review a PR, gispect reads commits from the local repository whose
+  folder name matches the PR repository's name, if it has them. Otherwise it
+  gets the files from GitHub.
+- `gispect mcp` serves the same combined view: paths in tool input and output
+  have the repository prefix.
 
 ## Diff modes
 
