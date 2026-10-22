@@ -1,6 +1,6 @@
-//! Rendering for the pull request view: the PR list screen, the review
-//! status bar, and the PR modals (inline comment editor, review
-//! submission, PR description).
+//! Rendering for the pull request view: the PR list screen with its info
+//! and dash list popups, the review status bar, and the PR modals (inline
+//! comment editor, review submission, PR description).
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::gh::{PrSummary, ReviewEvent, Side};
+use crate::gh::{PrDetails, PrSummary, ReviewEvent, Side};
 use crate::pr::{self, Load, PrList, PrTab, PreloadStatus, Preloader};
 
 pub(crate) const DIM: Style = Style::new().add_modifier(Modifier::DIM);
@@ -34,6 +34,21 @@ pub fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
     draw_tabs(f, list, chunks[1]);
     draw_rows(f, list, &statuses, chunks[2]);
     draw_list_footer(f, list, status, chunks[3]);
+
+    if let Some(scroll) = list.info_scroll {
+        if let Some((account, summary)) = list.selected_row() {
+            let info = Info {
+                summary: &summary,
+                details: app.preloader.details(&account, &summary),
+                marked: list.is_marked(&summary),
+                list: true,
+            };
+            draw_info(f, area, &info, scroll);
+        }
+    }
+    if let Some(dash) = &list.dash_list {
+        draw_dash_list(f, area, dash);
+    }
 }
 
 /// Preload progress of each list row, in row order.
@@ -70,6 +85,9 @@ fn draw_list_status(f: &mut Frame, list: &PrList, statuses: &[Option<PreloadStat
     );
     if let Some(filter) = &list.text_filter {
         text.push_str(&format!(" | filter: {filter}"));
+    }
+    if !list.marked.is_empty() {
+        text.push_str(&format!(" | marked: {}", list.marked.len()));
     }
     let ready = statuses
         .iter()
@@ -185,6 +203,7 @@ fn draw_rows(f: &mut Frame, list: &mut PrList, statuses: &[Option<PreloadStatus>
                     &cols,
                     rows_area.width as usize,
                     i == list.selected,
+                    list.is_marked(pr),
                 )
             })
             .collect();
@@ -230,6 +249,7 @@ fn pr_row(
     cols: &Columns,
     width: usize,
     selected: bool,
+    marked: bool,
 ) -> Line<'static> {
     let (glyph, glyph_color) = match (pr.is_draft, pr.state.as_str()) {
         (true, _) => ("◌", Color::DarkGray),
@@ -312,6 +332,9 @@ fn pr_row(
     spans.push(Span::raw(title));
     spans.push(Span::raw(" ".repeat(pad)));
     spans.extend(right);
+    if marked {
+        mark_gutter(&mut spans);
+    }
     if selected {
         for span in spans.iter_mut() {
             span.style = span.style.add_modifier(Modifier::REVERSED);
@@ -334,9 +357,20 @@ fn draw_list_footer(f: &mut Frame, list: &PrList, status: Option<String>, area: 
             format!(" {status}"),
             Style::default().fg(Color::Yellow),
         ))
+    } else if !list.marked.is_empty() {
+        Line::from(vec![
+            Span::styled(
+                format!(" {} marked: ", list.marked.len()),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled(
+                "y copy dash list  Space mark/unmark  u unmark all  i info  Enter review  Esc back",
+                DIM,
+            ),
+        ])
     } else {
         Line::from(Span::styled(
-            " Enter review  Tab/1-4 tab  a account  w repos  s state  d drafts  / filter  o browser  r refresh  Esc back  q quit",
+            " Enter review  i info  Space mark  y dash list  Tab/1-4 tab  a account  w repos  s state  d drafts  / filter  o browser  r refresh  Esc back",
             DIM,
         ))
     };
@@ -470,61 +504,187 @@ pub fn draw_pr_overlays(f: &mut Frame, app: &App, area: Rect) {
     }
 
     if let (Some(scroll), Some(session)) = (app.pr_info_scroll, &app.pr) {
-        let s = &session.summary;
-        let popup = centered(
-            area,
-            area.width.saturating_sub(8).min(100),
-            area.height.saturating_sub(4),
-        );
-        f.render_widget(Clear, popup);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {}#{} ", s.repo, s.number));
-        let inner = block.inner(popup);
-        f.render_widget(block, popup);
+        let info = Info {
+            summary: &session.summary,
+            details: Some(&session.details),
+            marked: false,
+            list: false,
+        };
+        draw_info(f, area, &info, scroll);
+    }
+}
 
-        let mut lines = vec![
-            Line::from(Span::styled(
-                s.title.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
+/// What the PR info popup shows.
+struct Info<'a> {
+    summary: &'a PrSummary,
+    /// `None` until a fetch of the details has been queued.
+    details: Option<&'a Load<PrDetails>>,
+    marked: bool,
+    /// Opened from the list: also lists the changed files and the keys.
+    list: bool,
+}
+
+/// The PR info popup: title, author, branches, state, size, review state,
+/// URL and description (plus the changed files, from the list).
+fn draw_info(f: &mut Frame, area: Rect, info: &Info, scroll: u16) {
+    let s = info.summary;
+    let popup = centered(
+        area,
+        area.width.saturating_sub(8).min(100),
+        area.height.saturating_sub(4),
+    );
+    f.render_widget(Clear, popup);
+    let mut title = format!(" {}#{} ", s.repo, s.number);
+    if info.marked {
+        title.push_str("▌marked ");
+    }
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let [body_area, hint] = if info.list {
+        split_last_line(inner)
+    } else {
+        [inner, Rect::default()]
+    };
+    let width = body_area.width as usize;
+
+    let (decision, decision_color) = match s.review_decision.as_deref() {
+        Some("APPROVED") => ("✓ approved", Color::Green),
+        Some("CHANGES_REQUESTED") => ("✗ changes requested", Color::Red),
+        Some("REVIEW_REQUIRED") => ("○ review required", Color::Yellow),
+        _ => ("", Color::Reset),
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            s.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(format!("@{}", s.author), Style::default().fg(Color::Blue)),
+            Span::raw(format!(
+                "  {} ← {}  {}{}  ",
+                s.base_ref_name,
+                s.head_ref_name,
+                s.state.to_lowercase(),
+                if s.is_draft { " (draft)" } else { "" }
             )),
-            Line::from(vec![
-                Span::styled(format!("@{}", s.author), Style::default().fg(Color::Blue)),
-                Span::raw(format!(
-                    "  {} ← {}  {}{}  ",
-                    s.base_ref_name,
-                    s.head_ref_name,
-                    s.state.to_lowercase(),
-                    if s.is_draft { " (draft)" } else { "" }
-                )),
-                Span::styled(
-                    format!("+{}", s.additions),
-                    Style::default().fg(Color::Green),
+            Span::styled(
+                format!("+{}", s.additions),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                format!(" -{}", s.deletions),
+                Style::default().fg(Color::Red),
+            ),
+            Span::styled(
+                format!(
+                    "  {} file{}",
+                    s.changed_files,
+                    if s.changed_files == 1 { "" } else { "s" }
                 ),
-                Span::styled(
-                    format!(" -{}", s.deletions),
-                    Style::default().fg(Color::Red),
+                DIM,
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(decision, Style::default().fg(decision_color)),
+            Span::styled(
+                format!(
+                    "{}updated {} ago",
+                    if decision.is_empty() { "" } else { "  " },
+                    pr::age(&s.updated_at)
                 ),
-            ]),
-            Line::from(Span::styled(s.url.clone(), DIM)),
-            Line::from(""),
-        ];
-        let body = session.details().map(|d| d.body.as_str()).unwrap_or("");
-        if body.trim().is_empty() {
+                DIM,
+            ),
+        ]),
+        Line::from(Span::styled(crate::gh::sanitize_line(&s.url), DIM)),
+        Line::from(""),
+    ];
+    match info.details {
+        Some(Load::Ready(d)) if d.body.trim().is_empty() => {
             lines.push(Line::from(Span::styled("(no description)", DIM)));
-        } else {
-            lines.extend(
-                wrap_chars(body, inner.width as usize)
-                    .into_iter()
-                    .map(Line::from),
-            );
         }
-        let max_scroll = lines.len().saturating_sub(inner.height as usize) as u16;
+        Some(Load::Ready(d)) => {
+            lines.extend(wrap_chars(&d.body, width).into_iter().map(Line::from));
+        }
+        Some(Load::Failed(e)) => lines.push(Line::from(Span::styled(
+            format!("(could not load the description: {e})"),
+            Style::default().fg(Color::Red),
+        ))),
+        Some(Load::Loading) | None => {
+            lines.push(Line::from(Span::styled("(loading description…)", DIM)));
+        }
+    }
+    if let (true, Some(Load::Ready(d))) = (info.list, info.details) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("files ({})", d.files.len()),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for file in &d.files {
+            let e = &file.entry;
+            let size = format!("  +{} -{}", e.additions, e.deletions);
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", e.status.marker()), DIM),
+                Span::raw(truncate(
+                    &crate::gh::sanitize_line(&e.path),
+                    width.saturating_sub(3 + Span::raw(size.as_str()).width()),
+                )),
+                Span::styled(size, DIM),
+            ]));
+        }
+    }
+    let max_scroll = lines.len().saturating_sub(body_area.height as usize) as u16;
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll.min(max_scroll), 0)),
+        body_area,
+    );
+    if info.list {
         f.render_widget(
-            Paragraph::new(lines).scroll((scroll.min(max_scroll), 0)),
-            inner,
+            Paragraph::new(
+                " j/k scroll · J/K next/prev PR · Space mark · Enter review · o browser · Esc close",
+            )
+            .style(DIM),
+            hint,
         );
     }
+}
+
+/// The dash list popup: the copied lines and how copying went.
+fn draw_dash_list(f: &mut Frame, area: Rect, dash: &pr::DashList) {
+    let lines: Vec<&str> = dash.text.lines().collect();
+    // Borders, copy note, blank line and hint around the list.
+    let height = (lines.len() as u16).saturating_add(5);
+    let popup = centered(area, area.width.saturating_sub(8).min(120), height);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" dash list ({}) ", lines.len()));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let [body, hint] = split_last_line(inner);
+    let width = body.width as usize;
+    let (note, color) = match &dash.copied {
+        Ok(msg) => (msg.as_str(), Color::Green),
+        Err(e) => (e.as_str(), Color::Red),
+    };
+    let mut text = vec![Line::from(Span::styled(
+        truncate(note, width),
+        Style::default().fg(color),
+    ))];
+    text.push(Line::from(""));
+    text.extend(lines.iter().map(|l| Line::from(truncate(l, width))));
+    f.render_widget(Paragraph::new(text), body);
+    f.render_widget(Paragraph::new(" y copy again · Esc close").style(DIM), hint);
+}
+
+/// Show a row as marked: a bar replaces its leading space.
+pub(crate) fn mark_gutter(spans: &mut Vec<Span<'static>>) {
+    if let Some(first) = spans.first_mut() {
+        if let Some(rest) = first.content.strip_prefix(' ') {
+            first.content = rest.to_string().into();
+        }
+    }
+    spans.insert(0, Span::styled("▌", Style::default().fg(Color::Magenta)));
 }
 
 fn verdict_color(event: ReviewEvent) -> Color {

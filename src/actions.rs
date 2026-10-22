@@ -1,13 +1,15 @@
 //! GitHub Actions view state: the repository → workflow → run tree, the
-//! run (dispatch) modal, key handling, and the background `gh` jobs that
-//! load workflows, poll runs while any is active, and start, re-run or
-//! cancel runs. Rendering lives in `actions_ui.rs`.
+//! run (dispatch) modal, workflows and runs marked for group actions (the
+//! group start modal, group re-run and cancel), key handling, and the
+//! background `gh` jobs that load workflows, poll runs while any is
+//! active, and start, re-run or cancel runs. Rendering lives in
+//! `actions_ui.rs`.
 //!
 //! Each repository is matched to its GitHub remote and to a logged-in
 //! `gh` account on that host, preferring one that may push (dispatching
 //! and re-running need write access).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -157,7 +159,7 @@ impl RepoNode {
 }
 
 /// One row of the tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RowKey {
     Repo(usize),
     /// Repository status line (loading, error, no workflows).
@@ -177,6 +179,11 @@ impl RowKey {
             | RowKey::Run(r, _, _)
             | RowKey::NoRuns(r, _) => r,
         }
+    }
+
+    /// Workflow and run rows can be marked for group actions.
+    fn markable(self) -> bool {
+        matches!(self, RowKey::Workflow(..) | RowKey::Run(..))
     }
 
     fn parent(self) -> Option<RowKey> {
@@ -206,14 +213,55 @@ pub enum ActionsEvent {
         workflow: u64,
         name: String,
         git_ref: String,
+        /// Group action this start belongs to, if any.
+        batch: Option<u64>,
         result: Result<(), String>,
     },
     RunDone {
         idx: usize,
         run_number: u64,
         action: RunAction,
+        batch: Option<u64>,
         result: Result<(), String>,
     },
+}
+
+/// A group action in flight: its results are summed up in one message.
+struct Batch {
+    id: u64,
+    /// What was done, e.g. `started` or `re-run requested for`.
+    verb: String,
+    /// What it was done to, e.g. `workflow(s)`.
+    noun: &'static str,
+    total: usize,
+    done: usize,
+    failed: Vec<String>,
+}
+
+/// A run a run action applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunTarget {
+    repo: usize,
+    run_id: u64,
+    run_number: u64,
+}
+
+/// One workflow of the group start modal, ready to send.
+pub struct BatchRun {
+    pub repo: usize,
+    pub workflow: u64,
+    pub name: String,
+    pub full_name: String,
+    pub git_ref: String,
+    inputs: Vec<(String, String)>,
+}
+
+/// Confirmation for starting every marked workflow with its default
+/// inputs.
+pub struct BatchModal {
+    pub runs: Vec<BatchRun>,
+    /// Marked workflows that can't be started this way, with why.
+    pub skipped: Vec<String>,
 }
 
 /// What a key press asks of the app.
@@ -347,8 +395,14 @@ pub struct ActionsView {
     /// Filter prompt being typed; filters live while typing.
     pub filter_input: Option<String>,
     pub modal: Option<RunModal>,
-    /// Run a first `X` asked to cancel; a second `X` confirms.
-    cancel_armed: Option<u64>,
+    pub batch_modal: Option<BatchModal>,
+    /// Workflow and run rows marked with Space for group actions.
+    pub marked: HashSet<RowKey>,
+    /// A run action a first key press asked for (cancel, or any group
+    /// action) and the runs it covers; pressing the key again confirms.
+    armed: Option<(RunAction, Vec<u64>)>,
+    batches: Vec<Batch>,
+    next_batch: u64,
     /// Rows area and scroll offset of the last draw, for mouse mapping.
     pub(crate) view_area: Rect,
     pub(crate) view_offset: usize,
@@ -386,7 +440,11 @@ impl ActionsView {
             text_filter: None,
             filter_input: None,
             modal: None,
-            cancel_armed: None,
+            batch_modal: None,
+            marked: HashSet::new(),
+            armed: None,
+            batches: Vec::new(),
+            next_batch: 0,
             view_area: Rect::default(),
             view_offset: 0,
             tx,
@@ -538,6 +596,23 @@ impl ActionsView {
                     workflow,
                     name,
                     git_ref,
+                    batch: Some(batch),
+                    result,
+                } => {
+                    if result.is_ok() {
+                        let repo = &mut self.repos[idx];
+                        repo.open_workflows.insert(workflow);
+                        repo.watch();
+                    }
+                    let failure = result.err().map(|e| format!("{name} on {git_ref}: {e}"));
+                    messages.extend(self.batch_step(batch, failure));
+                }
+                ActionsEvent::Dispatched {
+                    idx,
+                    workflow,
+                    name,
+                    git_ref,
+                    batch: None,
                     result,
                 } => match result {
                     Ok(()) => {
@@ -560,7 +635,21 @@ impl ActionsView {
                 ActionsEvent::RunDone {
                     idx,
                     run_number,
+                    batch: Some(batch),
+                    result,
+                    ..
+                } => {
+                    if result.is_ok() {
+                        self.repos[idx].watch();
+                    }
+                    let failure = result.err().map(|e| format!("#{run_number}: {e}"));
+                    messages.extend(self.batch_step(batch, failure));
+                }
+                ActionsEvent::RunDone {
+                    idx,
+                    run_number,
                     action,
+                    batch: None,
                     result,
                 } => match result {
                     Ok(()) => {
@@ -573,8 +662,89 @@ impl ActionsView {
                 },
             }
         }
+        self.prune_marks();
         self.fix_selection();
         messages
+    }
+
+    /// Count one finished job of group action `id`; the summary message
+    /// once the last one is in.
+    fn batch_step(&mut self, id: u64, failure: Option<String>) -> Option<String> {
+        let i = self.batches.iter().position(|b| b.id == id)?;
+        let batch = &mut self.batches[i];
+        batch.done += 1;
+        batch.failed.extend(failure);
+        if batch.done < batch.total {
+            return None;
+        }
+        let batch = self.batches.remove(i);
+        let ok = batch.total - batch.failed.len();
+        Some(if batch.failed.is_empty() {
+            format!("{} {ok} {}", batch.verb, batch.noun)
+        } else {
+            format!(
+                "{} {ok} of {} {}; failed: {}",
+                batch.verb,
+                batch.total,
+                batch.noun,
+                batch.failed.join("; ")
+            )
+        })
+    }
+
+    fn start_batch(&mut self, verb: String, noun: &'static str, total: usize) -> u64 {
+        self.next_batch += 1;
+        self.batches.push(Batch {
+            id: self.next_batch,
+            verb,
+            noun,
+            total,
+            done: 0,
+            failed: Vec::new(),
+        });
+        self.next_batch
+    }
+
+    /// Drop marks of workflows and runs that are no longer listed (a run
+    /// that fell off the recent runs, a deleted workflow).
+    fn prune_marks(&mut self) {
+        let repos = &self.repos;
+        self.marked.retain(|key| {
+            let Some(data) = repos.get(key.repo()).and_then(RepoNode::ready) else {
+                return true;
+            };
+            match *key {
+                RowKey::Workflow(_, w) => data.workflow(w).is_some(),
+                RowKey::Run(_, _, run) => data.runs.iter().any(|r| r.id == run),
+                _ => false,
+            }
+        });
+    }
+
+    /// Mark or unmark the selected workflow or run; false when the row
+    /// can't be marked.
+    fn toggle_mark(&mut self) -> bool {
+        let Some(key) = self.selected.filter(|k| k.markable()) else {
+            return false;
+        };
+        if !self.marked.remove(&key) {
+            self.marked.insert(key);
+        }
+        true
+    }
+
+    /// Marked workflow rows, by repository.
+    fn marked_workflows(&self) -> Vec<(usize, u64)> {
+        let mut out: Vec<(usize, u64)> = self
+            .marked
+            .iter()
+            .filter_map(|key| match *key {
+                RowKey::Workflow(r, w) => Some((r, w)),
+                _ => None,
+            })
+            .collect();
+        out.sort_unstable();
+        out
     }
 
     pub fn active_filter(&self) -> Option<&str> {
@@ -742,21 +912,35 @@ impl ActionsView {
     /// Open the run modal for the selected workflow, or say why it can't
     /// be run.
     fn open_modal(&mut self, repo: usize, workflow: u64) -> Option<String> {
+        match self.build_modal(repo, workflow)? {
+            Ok(modal) => {
+                self.modal = Some(modal);
+                None
+            }
+            Err(e) => Some(e),
+        }
+    }
+
+    /// The run modal for a workflow, filled with its defaults, or why it
+    /// can't be run.
+    fn build_modal(&self, repo: usize, workflow: u64) -> Option<Result<RunModal, String>> {
         let node = &self.repos[repo];
         let data = node.ready()?;
         let w = data.workflow(workflow)?;
         if !w.workflow.is_active() {
-            return Some(format!("{} is disabled on GitHub", w.workflow.name));
+            return Some(Err(format!("{} is disabled on GitHub", w.workflow.name)));
         }
         let inputs = match &w.dispatch {
             Dispatch::Manual(inputs) => inputs.clone(),
             Dispatch::NotManual => {
-                return Some(format!(
+                return Some(Err(format!(
                     "{} can't be run by hand (no workflow_dispatch trigger)",
                     w.workflow.name
-                ))
+                )))
             }
-            Dispatch::Unknown(e) => return Some(format!("can't read {}: {e}", w.workflow.path)),
+            Dispatch::Unknown(e) => {
+                return Some(Err(format!("can't read {}: {e}", w.workflow.path)))
+            }
         };
         // Run on the checked-out branch unless HEAD is detached.
         let git_ref = if gh::valid_ref(&node.branch) && node.branch != "HEAD" {
@@ -764,7 +948,7 @@ impl ActionsView {
         } else {
             data.default_branch.clone()
         };
-        self.modal = Some(RunModal {
+        Some(Ok(RunModal {
             repo,
             workflow,
             workflow_name: w.workflow.name.clone(),
@@ -777,8 +961,90 @@ impl ActionsView {
             field: 0,
             submitting: false,
             error: None,
-        });
-        None
+        }))
+    }
+
+    /// Open the group start modal for the marked workflows, or say why
+    /// none can be started.
+    fn open_batch_modal(&mut self) -> Option<String> {
+        let mut runs = Vec::new();
+        let mut skipped = Vec::new();
+        for (repo, workflow) in self.marked_workflows() {
+            let Some(result) = self.build_modal(repo, workflow) else {
+                continue;
+            };
+            let modal = match result {
+                Ok(modal) => modal,
+                Err(e) => {
+                    skipped.push(e);
+                    continue;
+                }
+            };
+            match modal.validate() {
+                Ok(inputs) => runs.push(BatchRun {
+                    repo,
+                    workflow,
+                    name: modal.workflow_name,
+                    full_name: modal.full_name,
+                    git_ref: modal.git_ref.trim().to_string(),
+                    inputs,
+                }),
+                Err(e) => skipped.push(format!(
+                    "{}: {e} (start it alone with Enter)",
+                    modal.workflow_name
+                )),
+            }
+        }
+        match (runs.is_empty(), skipped.len()) {
+            (true, 0) => Some("no workflows marked (Space marks)".to_string()),
+            (true, 1) => skipped.pop(),
+            (true, n) => Some(format!("none of the {n} marked workflows can be started")),
+            (false, _) => {
+                self.batch_modal = Some(BatchModal { runs, skipped });
+                None
+            }
+        }
+    }
+
+    /// Start every workflow of the group start modal.
+    fn submit_batch(&mut self) -> Option<String> {
+        let modal = self.batch_modal.take()?;
+        let total = modal.runs.len();
+        let batch = self.start_batch("started".to_string(), "workflow(s)", total);
+        for run in modal.runs {
+            let Some(data) = self.repo_data(run.repo) else {
+                let _ = self.tx.send(ActionsEvent::Dispatched {
+                    idx: run.repo,
+                    workflow: run.workflow,
+                    name: run.name,
+                    git_ref: run.git_ref,
+                    batch: Some(batch),
+                    result: Err("repository is reloading".to_string()),
+                });
+                continue;
+            };
+            let account = data.account.clone();
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let result = gh::dispatch_workflow(
+                    &account,
+                    &run.full_name,
+                    run.workflow,
+                    &run.git_ref,
+                    &run.inputs,
+                )
+                .map_err(|e| e.to_string());
+                let _ = tx.send(ActionsEvent::Dispatched {
+                    idx: run.repo,
+                    workflow: run.workflow,
+                    name: run.name,
+                    git_ref: run.git_ref,
+                    batch: Some(batch),
+                    result,
+                });
+            });
+        }
+        Some(format!("starting {total} workflow(s)…"))
     }
 
     fn submit_modal(&mut self) {
@@ -813,6 +1079,7 @@ impl ActionsView {
                 workflow,
                 name,
                 git_ref,
+                batch: None,
                 result,
             });
         });
@@ -843,10 +1110,123 @@ impl ActionsView {
                 idx,
                 run_number,
                 action,
+                batch: None,
                 result,
             });
         });
         Some(format!("requesting {} of #{run_number}…", action.label()))
+    }
+
+    /// Whether `action` can apply to `run` now.
+    fn applies(action: RunAction, run: &WorkflowRun) -> bool {
+        match action {
+            RunAction::Cancel => run.is_active(),
+            RunAction::Rerun => !run.is_active(),
+            RunAction::RerunFailed => {
+                !run.is_active()
+                    && !matches!(run.conclusion.as_deref(), Some("success" | "skipped"))
+            }
+        }
+    }
+
+    /// The runs a group `action` covers: each marked run,
+    /// and for each marked workflow its latest run (every active run, to
+    /// cancel). Also how many marked rows it doesn't apply to.
+    fn group_targets(&self, action: RunAction) -> (Vec<RunTarget>, usize) {
+        let mut keys: Vec<RowKey> = self.marked.iter().copied().collect();
+        keys.sort_unstable();
+        let mut seen = BTreeSet::new();
+        let mut targets = Vec::new();
+        let mut skipped = 0;
+        for key in keys {
+            let Some(data) = self.repo_data(key.repo()) else {
+                skipped += 1;
+                continue;
+            };
+            let runs: Vec<&WorkflowRun> = match key {
+                RowKey::Run(_, _, id) => data.runs.iter().filter(|r| r.id == id).collect(),
+                RowKey::Workflow(_, w) if action == RunAction::Cancel => {
+                    data.runs_of(w).filter(|r| r.is_active()).collect()
+                }
+                RowKey::Workflow(_, w) => data.latest_run(w).into_iter().collect(),
+                _ => continue,
+            };
+            let mut applies = false;
+            for run in runs.into_iter().filter(|r| Self::applies(action, r)) {
+                applies = true;
+                // A marked run and its marked workflow can name the same run.
+                if seen.insert((key.repo(), run.id)) {
+                    targets.push(RunTarget {
+                        repo: key.repo(),
+                        run_id: run.id,
+                        run_number: run.run_number,
+                    });
+                }
+            }
+            if !applies {
+                skipped += 1;
+            }
+        }
+        (targets, skipped)
+    }
+
+    /// `R`, `F` or `X` with rows marked: the first press says what it
+    /// will do, the second does it to every marked run it applies to.
+    fn group_run_action(
+        &mut self,
+        action: RunAction,
+        armed: Option<(RunAction, Vec<u64>)>,
+    ) -> String {
+        let (targets, skipped) = self.group_targets(action);
+        if targets.is_empty() {
+            return format!("{} applies to none of the marked rows", action.label());
+        }
+        let ids: Vec<u64> = targets.iter().map(|t| t.run_id).collect();
+        if armed.as_ref() != Some(&(action, ids.clone())) {
+            let key = match action {
+                RunAction::Rerun => 'R',
+                RunAction::RerunFailed => 'F',
+                RunAction::Cancel => 'X',
+            };
+            let skip = if skipped > 0 {
+                format!(" ({skipped} marked row(s) skipped)")
+            } else {
+                String::new()
+            };
+            self.armed = Some((action, ids));
+            return format!(
+                "press {key} again: {} of {} run(s){skip}",
+                action.label(),
+                targets.len()
+            );
+        }
+        let verb = format!("{} requested for", action.label());
+        let batch = self.start_batch(verb, "run(s)", targets.len());
+        for target in &targets {
+            let Some(data) = self.repo_data(target.repo) else {
+                continue;
+            };
+            let account = data.account.clone();
+            let full_name = data.full_name.clone();
+            let tx = self.tx.clone();
+            let RunTarget {
+                repo: idx,
+                run_id,
+                run_number,
+            } = *target;
+            std::thread::spawn(move || {
+                let result =
+                    gh::run_action(&account, &full_name, run_id, action).map_err(|e| e.to_string());
+                let _ = tx.send(ActionsEvent::RunDone {
+                    idx,
+                    run_number,
+                    action,
+                    batch: Some(batch),
+                    result,
+                });
+            });
+        }
+        format!("requesting {} of {} run(s)…", action.label(), targets.len())
     }
 
     fn open_in_browser(&self) -> Option<String> {
@@ -865,7 +1245,21 @@ impl ActionsView {
     }
 
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> KeyOutcome {
-        let armed = self.cancel_armed.take();
+        let armed = self.armed.take();
+        if self.batch_modal.is_some() {
+            let status = match code {
+                KeyCode::Esc => {
+                    self.batch_modal = None;
+                    None
+                }
+                KeyCode::Enter => self.submit_batch(),
+                KeyCode::Char('s') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.submit_batch()
+                }
+                _ => None,
+            };
+            return KeyOutcome::Done(status);
+        }
         if let Some(modal) = self.modal.as_mut() {
             match modal.key(code, modifiers) {
                 ModalAction::Cancel => self.modal = None,
@@ -907,7 +1301,26 @@ impl ActionsView {
                 self.set_expanded(Some(true));
             }
             KeyCode::Char(' ') => {
-                self.set_expanded(None);
+                if self.toggle_mark() {
+                    self.move_selection(1);
+                } else {
+                    // Repository rows fold instead.
+                    self.set_expanded(None);
+                }
+            }
+            KeyCode::Char('u') => {
+                let n = std::mem::take(&mut self.marked).len();
+                status = Some(format!("unmarked {n} row(s)"));
+            }
+            KeyCode::Char('s') => {
+                status = if self.marked_workflows().is_empty() {
+                    match self.selected {
+                        Some(RowKey::Workflow(r, w)) => self.open_modal(r, w),
+                        _ => Some("select or mark (Space) a workflow to start".to_string()),
+                    }
+                } else {
+                    self.open_batch_modal()
+                };
             }
             KeyCode::Char('h') | KeyCode::Left => {
                 if !self.set_expanded(Some(false)) {
@@ -927,6 +1340,14 @@ impl ActionsView {
                 Some(RowKey::Run(..)) => status = self.open_in_browser(),
                 _ => {}
             },
+            KeyCode::Char('R' | 'F' | 'X') if !self.marked.is_empty() => {
+                let action = match code {
+                    KeyCode::Char('R') => RunAction::Rerun,
+                    KeyCode::Char('F') => RunAction::RerunFailed,
+                    _ => RunAction::Cancel,
+                };
+                status = Some(self.group_run_action(action, armed));
+            }
             KeyCode::Char('R') => status = self.start_run_action(RunAction::Rerun),
             KeyCode::Char('F') => status = self.start_run_action(RunAction::RerunFailed),
             KeyCode::Char('X') => {
@@ -934,11 +1355,11 @@ impl ActionsView {
                     .target_run()
                     .map(|(_, r)| (r.id, r.run_number, r.is_active()));
                 status = match target {
-                    Some((id, _, true)) if armed == Some(id) => {
+                    Some((id, _, true)) if armed == Some((RunAction::Cancel, vec![id])) => {
                         self.start_run_action(RunAction::Cancel)
                     }
                     Some((id, number, true)) => {
-                        self.cancel_armed = Some(id);
+                        self.armed = Some((RunAction::Cancel, vec![id]));
                         Some(format!("press X again to cancel run #{number}"))
                     }
                     Some((_, number, false)) => Some(format!("#{number} is not running")),
@@ -966,7 +1387,7 @@ impl ActionsView {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.modal.is_some() {
+        if self.modal.is_some() || self.batch_modal.is_some() {
             return;
         }
         match mouse.kind {
@@ -1255,7 +1676,11 @@ mod tests {
             text_filter: None,
             filter_input: None,
             modal: None,
-            cancel_armed: None,
+            batch_modal: None,
+            marked: HashSet::new(),
+            armed: None,
+            batches: Vec::new(),
+            next_batch: 0,
             view_area: Rect::default(),
             view_offset: 0,
             tx,
@@ -1349,10 +1774,117 @@ mod tests {
             panic!("expected a status");
         };
         assert_eq!(msg, "press X again to cancel run #7");
-        assert_eq!(v.cancel_armed, Some(10));
+        assert_eq!(v.armed, Some((RunAction::Cancel, vec![10])));
         // Any other key disarms.
         v.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(v.cancel_armed, None);
+        assert_eq!(v.armed, None);
+    }
+
+    fn status(v: &mut ActionsView, code: KeyCode) -> String {
+        match v.handle_key(code, KeyModifiers::NONE) {
+            KeyOutcome::Done(Some(msg)) => msg,
+            _ => panic!("expected a status"),
+        }
+    }
+
+    #[test]
+    fn space_marks_and_group_actions_need_a_second_press() {
+        // wf1: run 10 (active), run 11 (failed); wf2: run 20 (success).
+        let mut d = data(&[1, 2], &[(10, 1), (11, 1), (20, 2)]);
+        d.runs[0].status = "in_progress".into();
+        d.runs[1].conclusion = Some("failure".into());
+        d.runs[2].conclusion = Some("success".into());
+        let mut v = view(false, vec![("r", Load::Ready(d))]);
+        v.repos[0].open_workflows.insert(1);
+        v.selected = Some(RowKey::Workflow(0, 1));
+        v.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(v.selected, Some(RowKey::Run(0, 1, 10)), "Space moves down");
+        v.selected = Some(RowKey::Run(0, 1, 11));
+        v.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        v.selected = Some(RowKey::Workflow(0, 2));
+        v.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(v.marked.len(), 3);
+
+        // Cancel: the active run of wf1; run 11 and wf2 don't apply.
+        let (targets, skipped) = v.group_targets(RunAction::Cancel);
+        assert_eq!(targets.iter().map(|t| t.run_id).collect::<Vec<_>>(), [10]);
+        assert_eq!(skipped, 2);
+        // Re-run failed: run 11 only (wf1's latest is still running, wf2's
+        // latest succeeded).
+        let (targets, _) = v.group_targets(RunAction::RerunFailed);
+        assert_eq!(targets.iter().map(|t| t.run_id).collect::<Vec<_>>(), [11]);
+        let (targets, _) = v.group_targets(RunAction::Rerun);
+        assert_eq!(
+            targets.iter().map(|t| t.run_id).collect::<BTreeSet<_>>(),
+            BTreeSet::from([11, 20])
+        );
+
+        assert_eq!(
+            status(&mut v, KeyCode::Char('R')),
+            "press R again: re-run of 2 run(s) (1 marked row(s) skipped)"
+        );
+        assert!(v.armed.is_some());
+        // A different key disarms; nothing was sent.
+        status(&mut v, KeyCode::Char('X'));
+        assert_eq!(v.armed, Some((RunAction::Cancel, vec![10])));
+        assert!(v.batches.is_empty());
+
+        v.handle_key(KeyCode::Char('u'), KeyModifiers::NONE);
+        assert!(v.marked.is_empty());
+    }
+
+    #[test]
+    fn a_run_marked_twice_is_one_target_and_not_skipped() {
+        let mut v = view(false, vec![("r", Load::Ready(data(&[1], &[(10, 1)])))]);
+        v.marked
+            .extend([RowKey::Workflow(0, 1), RowKey::Run(0, 1, 10)]);
+        let (targets, skipped) = v.group_targets(RunAction::Rerun);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn group_start_skips_workflows_that_need_input() {
+        let mut d = data(&[1, 2, 3], &[]);
+        d.workflows[0].dispatch = Dispatch::Manual(vec![]);
+        d.workflows[1].dispatch =
+            Dispatch::Manual(vec![input("version", InputKind::String, true, "")]);
+        let mut v = view(false, vec![("r", Load::Ready(d))]);
+        v.marked.extend([
+            RowKey::Workflow(0, 1),
+            RowKey::Workflow(0, 2),
+            RowKey::Workflow(0, 3),
+        ]);
+        v.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        let modal = v.batch_modal.as_ref().expect("group start modal");
+        assert_eq!(modal.runs.len(), 1);
+        assert_eq!(modal.runs[0].name, "wf1");
+        assert_eq!(modal.runs[0].git_ref, "main");
+        assert_eq!(modal.skipped.len(), 2);
+        v.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(v.batch_modal.is_none());
+    }
+
+    #[test]
+    fn batch_summary_counts_failures() {
+        let mut v = view(false, vec![("r", Load::Ready(data(&[1], &[])))]);
+        let id = v.start_batch("started".into(), "workflow(s)", 2);
+        assert_eq!(v.batch_step(id, None), None);
+        assert_eq!(
+            v.batch_step(id, Some("wf2 on main: HTTP 422".into()))
+                .unwrap(),
+            "started 1 of 2 workflow(s); failed: wf2 on main: HTTP 422"
+        );
+        assert!(v.batches.is_empty());
+    }
+
+    #[test]
+    fn marks_of_vanished_runs_are_dropped() {
+        let mut v = view(false, vec![("r", Load::Ready(data(&[1], &[(10, 1)])))]);
+        v.marked
+            .extend([RowKey::Run(0, 1, 10), RowKey::Run(0, 1, 99)]);
+        v.prune_marks();
+        assert_eq!(v.marked.len(), 1);
     }
 
     #[test]

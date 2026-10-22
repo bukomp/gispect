@@ -174,8 +174,8 @@ refreshed. Rows show state (● open/merged/closed, ◌ draft), `repo#number`,
 title, account (when more than one), author, `+added -removed`, review
 decision and age.
 
-The PRs in the open tab (after filters) preload in the background, top row
-first: details, then the contents of up to 100 files per PR, 4 fetches at a
+The PRs in the open tab (after filters) preload in the background, the
+selected PR first, then from the top: details, then the contents of up to 100 files per PR, 4 fetches at a
 time, up to 256 MB in total. `◇` after the state glyph means the PR is still loading,
 `◆` means it is ready and opens at once, and the status line shows
 `preloaded: n/m`. When you switch tabs or filters, queued work for PRs that
@@ -195,11 +195,35 @@ requests per file).
 | `/` | text filter over title, repo, author, branch and `#number` (smart-case, live; `Enter` keeps, `Esc` clears) |
 | `r` | refresh |
 | `o` | open in browser |
+| `i` | PR info: title, author, branches, state, size, review state, description and changed files |
+| `Space` | mark / unmark the PR and move down |
+| `u` | unmark all |
+| `y` | dash list of the marked PRs (else of the selected PR), copied to the clipboard |
 | `Enter` | review the selected PR |
 | `Esc` | back (clears the filter first) |
 | `q` | quit |
 
 Mouse: wheel moves the selection, click selects.
+
+The info popup (`i`) shows a PR without opening it. The description and file
+list come from the preloaded details, so they show at once when the PR is
+preloaded. In the popup, `j` / `k` scroll, `J` / `K` go to the next / previous
+PR, `Space` marks, `Enter` opens the review, `o` opens the browser, and `Esc`
+or `i` closes it.
+
+Marked PRs show `▌` at the start of the row, and the status line shows
+`marked: n`. Marks stay when you switch tabs or filters. The dash list has one
+line per PR, in the order you marked them:
+
+```
+- Fix login redirect — https://github.com/owner/repo/pull/123
+```
+
+`y` copies it with `pbcopy`, `wl-copy`, `xclip`, `xsel` or `clip.exe`, whichever
+is installed. Otherwise it sends the text to the terminal as an OSC 52 escape
+sequence, which most modern terminals put on the clipboard (in tmux, set
+`set-clipboard on`). The popup also shows the list, so you can select it by
+hand.
 
 ### Reviewing
 
@@ -282,14 +306,16 @@ progress, `◌` queued / waiting, `!` action required, `·` no recent runs.
 | `j` / `k`, `↓` / `↑` | select |
 | `g` / `G` | top / bottom |
 | `PgDn` / `PgUp` | page |
-| `Space` | expand / collapse |
+| `Space` | mark / unmark a workflow or run and move down (on a repository row: expand / collapse) |
+| `u` | unmark all |
 | `l` / `→` | expand |
 | `h` / `←` | collapse, or go to the parent row |
 | `e` | expand / collapse all (repositories, or every workflow's runs in a single repository) |
 | `Enter` | run the workflow (form), expand a repository, or open a run in the browser |
-| `R` | re-run the selected run (on a workflow row: its latest run) |
-| `F` | re-run failed jobs |
-| `X` | cancel an active run (press twice to confirm) |
+| `s` | start the marked workflows (else the form for the selected workflow) |
+| `R` | re-run the selected run (on a workflow row: its latest run); with marks, all marked |
+| `F` | re-run failed jobs; with marks, all marked |
+| `X` | cancel an active run (press twice to confirm); with marks, all marked |
 | `o` | open the workflow or run in the browser |
 | `/` | filter repositories and workflows by name or path (smart-case, live; `Enter` keeps, `Esc` clears) |
 | `r` | refresh everything |
@@ -297,6 +323,27 @@ progress, `◌` queued / waiting, `!` action required, `·` no recent runs.
 | `q` | quit |
 
 Mouse: wheel moves the selection, click selects.
+
+### Group actions
+
+Mark workflows and runs with `Space` (in one or more repositories). Marked rows
+show `▌`, and the status line and footer show how many are marked. Marks of
+runs that drop off the recent runs list are removed.
+
+- `s` opens a confirmation that lists the marked workflows to start, each on
+  its repository's checked-out branch (the default branch when HEAD is
+  detached) with its default inputs. Workflows that can't start this way are
+  listed as skipped with the reason: no `workflow_dispatch` trigger, disabled,
+  or a required input with no default (start those one at a time with
+  `Enter`). `Enter` starts them all, `Esc` cancels.
+- `R`, `F` and `X` apply to every marked run, and to the latest run of every
+  marked workflow (`X`: every active run of it). Runs the action doesn't apply
+  to are skipped: `R` and `F` skip active runs, `F` also skips runs that
+  succeeded or were skipped, and `X` skips finished runs. The first press
+  shows how many runs it covers, and pressing the same key again does it.
+
+When all requests are done, one message sums up how many succeeded, with the
+errors of those that failed.
 
 ### Running a workflow
 

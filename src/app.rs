@@ -27,7 +27,7 @@ use crate::highlight::{self, HlLines};
 use crate::pr::{self, Load, PrEvent};
 use crate::search;
 use crate::types::{DiffMode, FileEntry, FileStatus, RowKind, SideBySideDiff};
-use crate::{diff, update};
+use crate::{clipboard, diff, update};
 
 /// How long a footer notification stays visible before the shortcut
 /// hints come back.
@@ -1435,15 +1435,20 @@ impl App {
         self.sync_preload();
     }
 
-    /// Point the preloader at the PRs the list currently shows, top row
-    /// first.
+    /// Point the preloader at the PRs the list currently shows: the
+    /// selected one first (so its info and review open soonest), then the
+    /// rest from the top.
     fn sync_preload(&mut self) {
         let Some(list) = self.pr_list.as_ref() else {
             return;
         };
         let accounts = list.account_list();
-        let targets = list
-            .rows()
+        let mut rows = list.rows();
+        if list.selected < rows.len() {
+            let selected = rows.remove(list.selected);
+            rows.insert(0, selected);
+        }
+        let targets = rows
             .into_iter()
             .filter_map(|(a, pr)| {
                 Some(pr::PreloadTarget {
@@ -1792,6 +1797,43 @@ impl App {
 
     fn handle_pr_list_key(&mut self, code: KeyCode, modifiers: KeyModifiers, armed: bool) {
         let list = self.list_mut();
+        if list.dash_list.is_some() {
+            match code {
+                KeyCode::Char('y') => self.copy_dash_list(),
+                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => list.dash_list = None,
+                _ => {}
+            }
+            return;
+        }
+        let len = list.rows().len();
+        if let Some(scroll) = list.info_scroll.as_mut() {
+            match code {
+                KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
+                KeyCode::Char('k') | KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                KeyCode::PageDown => *scroll = scroll.saturating_add(10),
+                KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
+                // Step through PRs without closing the popup.
+                KeyCode::Char('J') => {
+                    list.selected = (list.selected + 1).min(len.saturating_sub(1));
+                    list.info_scroll = Some(0);
+                }
+                KeyCode::Char('K') => {
+                    list.selected = list.selected.saturating_sub(1);
+                    list.info_scroll = Some(0);
+                }
+                KeyCode::Char(' ') => {
+                    list.toggle_mark();
+                }
+                KeyCode::Char('o') => self.open_in_browser(),
+                KeyCode::Enter => {
+                    list.info_scroll = None;
+                    self.open_selected_pr(armed);
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => list.info_scroll = None,
+                _ => {}
+            }
+            return;
+        }
         if let Some(input) = list.filter_input.as_mut() {
             match code {
                 KeyCode::Esc => {
@@ -1815,7 +1857,6 @@ impl App {
             return;
         }
 
-        let len = list.rows().len();
         let page = (list.view_area.height as usize).max(1);
         match code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1883,6 +1924,21 @@ impl App {
                 self.set_status("refreshing…");
             }
             KeyCode::Char('o') => self.open_in_browser(),
+            KeyCode::Char('i') => {
+                if !list.rows().is_empty() {
+                    list.info_scroll = Some(0);
+                }
+            }
+            KeyCode::Char(' ') => {
+                if list.toggle_mark().is_some() {
+                    list.selected = (list.selected + 1).min(len.saturating_sub(1));
+                }
+            }
+            KeyCode::Char('u') => {
+                let n = std::mem::take(&mut list.marked).len();
+                self.set_status(format!("unmarked {n} PR(s)"));
+            }
+            KeyCode::Char('y') => self.copy_dash_list(),
             KeyCode::Enter => self.open_selected_pr(armed),
             KeyCode::Esc => {
                 if list.text_filter.take().is_some() {
@@ -1900,8 +1956,38 @@ impl App {
         }
     }
 
+    /// Copy the dash list of marked PRs (else the selected one) and show
+    /// it in a popup.
+    fn copy_dash_list(&mut self) {
+        let list = self.list_mut();
+        let Some(text) = list.dash_list_text() else {
+            self.set_status("no pull request selected");
+            return;
+        };
+        let count = text.lines().count();
+        let copied = match clipboard::copy(&text) {
+            Ok(clipboard::Copied::Tool(tool)) => Ok(format!("copied {count} line(s) via {tool}")),
+            Ok(clipboard::Copied::Terminal) => Ok(format!(
+                "sent {count} line(s) to the terminal clipboard (OSC 52)"
+            )),
+            Err(e) => Err(format!("could not copy: {e}")),
+        };
+        list.dash_list = Some(pr::DashList { text, copied });
+    }
+
     fn handle_pr_list_mouse(&mut self, mouse: MouseEvent) {
         let list = self.list_mut();
+        if list.dash_list.is_some() {
+            return;
+        }
+        if let Some(scroll) = list.info_scroll.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => *scroll = scroll.saturating_add(3),
+                MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(3),
+                _ => {}
+            }
+            return;
+        }
         let len = list.rows().len();
         match mouse.kind {
             MouseEventKind::ScrollDown => {

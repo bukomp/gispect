@@ -1,6 +1,7 @@
 mod actions;
 mod actions_ui;
 mod app;
+mod clipboard;
 mod config;
 mod diff;
 mod gh;

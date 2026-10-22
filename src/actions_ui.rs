@@ -1,5 +1,5 @@
 //! Rendering for the GitHub Actions view: the repository → workflow →
-//! run tree and the run (dispatch) modal.
+//! run tree, the run (dispatch) modal and the group start modal.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -7,11 +7,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::actions::{ActionsView, Dispatch, RepoData, RowKey, RunModal, WorkflowNode};
+use crate::actions::{ActionsView, BatchModal, Dispatch, RepoData, RowKey, RunModal, WorkflowNode};
 use crate::app::App;
 use crate::gh::WorkflowRun;
 use crate::pr::{self, Load};
-use crate::pr_ui::{centered, split_last_line, truncate, DIM};
+use crate::pr_ui::{centered, mark_gutter, split_last_line, truncate, DIM};
 use crate::workflow::InputKind;
 
 /// Widest workflow name column.
@@ -36,6 +36,9 @@ pub fn draw_actions(f: &mut Frame, app: &mut App, area: Rect) {
     draw_footer(f, view, status, chunks[2]);
     if let Some(modal) = &view.modal {
         draw_modal(f, modal, area);
+    }
+    if let Some(modal) = &view.batch_modal {
+        draw_batch_modal(f, modal, area);
     }
 }
 
@@ -68,6 +71,9 @@ fn draw_status(f: &mut Frame, view: &ActionsView, area: Rect) {
     }
     if let Some(filter) = &view.text_filter {
         text.push_str(&format!(" | filter: {filter}"));
+    }
+    if !view.marked.is_empty() {
+        text.push_str(&format!(" | marked: {}", view.marked.len()));
     }
     f.render_widget(Paragraph::new(text), area);
 }
@@ -110,6 +116,9 @@ fn draw_tree(f: &mut Frame, view: &mut ActionsView, area: Rect) {
             .take(height)
             .map(|(i, key)| {
                 let mut line = row_line(view, *key, width);
+                if view.marked.contains(key) {
+                    mark_gutter(&mut line.spans);
+                }
                 if i == selected {
                     for span in line.spans.iter_mut() {
                         span.style = span.style.add_modifier(Modifier::REVERSED);
@@ -375,9 +384,20 @@ fn draw_footer(f: &mut Frame, view: &ActionsView, status: Option<String>, area: 
             format!(" {status}"),
             Style::default().fg(Color::Yellow),
         ))
+    } else if !view.marked.is_empty() {
+        Line::from(vec![
+            Span::styled(
+                format!(" {} marked: ", view.marked.len()),
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled(
+                "s start  R re-run  F re-run failed  X cancel  Space mark/unmark  u unmark all  Esc back",
+                DIM,
+            ),
+        ])
     } else {
         Line::from(Span::styled(
-            " Enter run/open  Space/←→ fold  e fold all  R re-run  F re-run failed  X cancel  o browser  / filter  r refresh  Esc back",
+            " Enter run/open  Space mark  ←→ fold  e fold all  s start  R re-run  F re-run failed  X cancel  o browser  / filter  r refresh  Esc back",
             DIM,
         ))
     };
@@ -503,6 +523,64 @@ fn draw_modal(f: &mut Frame, modal: &RunModal, area: Rect) {
     f.render_widget(
         Paragraph::new(" Tab/↑↓ field · Space/←→ toggle · type to edit · Enter run · Esc cancel")
             .style(DIM),
+        hint,
+    );
+}
+
+/// Confirmation listing the marked workflows to start and those skipped.
+fn draw_batch_modal(f: &mut Frame, modal: &BatchModal, area: Rect) {
+    let rows = modal.runs.len() + modal.skipped.len() + usize::from(!modal.skipped.is_empty());
+    let height = (rows as u16).saturating_add(5);
+    let popup = centered(area, 90, height);
+    f.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " start {} workflow{} ",
+        modal.runs.len(),
+        if modal.runs.len() == 1 { "" } else { "s" }
+    ));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let [body, hint] = split_last_line(inner);
+    let width = body.width as usize;
+    let name_width = modal
+        .runs
+        .iter()
+        .map(|r| Span::raw(r.name.as_str()).width())
+        .max()
+        .unwrap_or(0)
+        .min(MAX_NAME);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " with default inputs, on each repository's checked-out branch",
+            DIM,
+        )),
+        Line::from(""),
+    ];
+    for run in &modal.runs {
+        let line = vec![
+            Span::styled(" ▶ ", Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{:<name_width$}  ", truncate(&run.name, name_width)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(run.full_name.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("  on {}", run.git_ref), DIM),
+        ];
+        lines.push(pad_to(line, width));
+    }
+    if !modal.skipped.is_empty() {
+        lines.push(Line::from(Span::styled(" skipped:", DIM)));
+        for why in &modal.skipped {
+            lines.push(Line::from(Span::styled(
+                format!("   {}", truncate(why, width.saturating_sub(3))),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), body);
+    f.render_widget(
+        Paragraph::new(" Enter start all · Esc cancel").style(DIM),
         hint,
     );
 }

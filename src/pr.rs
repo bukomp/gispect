@@ -1,5 +1,6 @@
 //! Pull request view state: the PR list (tabs, account/state/draft/text
-//! filters, the local-repository scope and a per-query result cache), the per-PR review session
+//! filters, the local-repository scope, a per-query result cache and the
+//! PRs marked for a dash list), the per-PR review session
 //! (fetched files, cached contents, draft inline comments), the comment
 //! and review editors, the background preloader that fetches the PRs of
 //! the open list tab ahead of time, and the background `gh` jobs feeding
@@ -204,6 +205,13 @@ pub struct PrList {
     pub filter_input: Option<String>,
     pub results: HashMap<QueryKey, Load<Vec<PrSummary>>>,
     pub selected: usize,
+    /// PRs marked with Space, in marking order; one entry per URL even
+    /// when several accounts list the PR.
+    pub marked: Vec<PrSummary>,
+    /// Scroll of the selected PR's info popup; `Some` while it is open.
+    pub info_scroll: Option<u16>,
+    /// The dash list popup, while it is open.
+    pub dash_list: Option<DashList>,
     /// Rows area and scroll offset of the last draw, for mouse mapping.
     pub(crate) view_area: ratatui::layout::Rect,
     pub(crate) view_offset: usize,
@@ -223,6 +231,9 @@ impl PrList {
             filter_input: None,
             results: HashMap::new(),
             selected: 0,
+            marked: Vec::new(),
+            info_scroll: None,
+            dash_list: None,
             view_area: ratatui::layout::Rect::default(),
             view_offset: 0,
         }
@@ -345,6 +356,42 @@ impl PrList {
         Some((self.account_list().get(a)?.clone(), pr.clone()))
     }
 
+    pub fn is_marked(&self, pr: &PrSummary) -> bool {
+        self.marked.iter().any(|m| m.url == pr.url)
+    }
+
+    /// Mark or unmark the selected PR; returns whether it is now marked.
+    pub fn toggle_mark(&mut self) -> Option<bool> {
+        let (_, pr) = self.selected_row()?;
+        match self.marked.iter().position(|m| m.url == pr.url) {
+            Some(i) => {
+                self.marked.remove(i);
+                Some(false)
+            }
+            None => {
+                self.marked.push(pr);
+                Some(true)
+            }
+        }
+    }
+
+    /// Dash list of the marked PRs, else of the selected one.
+    pub fn dash_list_text(&self) -> Option<String> {
+        let selected;
+        let prs: Vec<&PrSummary> = if self.marked.is_empty() {
+            selected = self.selected_row()?.1;
+            vec![&selected]
+        } else {
+            self.marked.iter().collect()
+        };
+        Some(
+            prs.into_iter()
+                .map(dash_line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     /// Forget cached searches (for one account, or all) so they re-run.
     pub fn invalidate(&mut self, account: Option<usize>) {
         match account {
@@ -352,6 +399,17 @@ impl PrList {
             None => self.results.clear(),
         }
     }
+}
+
+/// The dash list popup: its text and what copying it did.
+pub struct DashList {
+    pub text: String,
+    pub copied: Result<String, String>,
+}
+
+/// One dash list line: `- title — url`.
+fn dash_line(pr: &PrSummary) -> String {
+    format!("- {} — {}", pr.title, gh::sanitize_line(&pr.url))
 }
 
 /// Smart-case text match against a PR's title, repo, author, branch and
@@ -961,6 +1019,15 @@ impl Preloader {
         true
     }
 
+    /// Preloaded details of `summary` (loading, failed or ready), if
+    /// they are still current.
+    pub fn details(&self, account: &Account, summary: &PrSummary) -> Option<&Load<PrDetails>> {
+        self.cache
+            .get(&pr_key(account, summary))
+            .filter(|p| p.updated_at == summary.updated_at)
+            .map(|p| &p.details)
+    }
+
     /// Preloaded details and ready file contents of `summary`, if its
     /// details are in and still match the list.
     pub fn take(
@@ -1182,6 +1249,31 @@ mod tests {
         assert_eq!(numbers(&list), vec![1]);
         list.text_filter = Some("Feat".into()); // smart-case: no match
         assert!(numbers(&list).is_empty());
+    }
+
+    #[test]
+    fn marks_dedupe_by_url_and_feed_the_dash_list() {
+        let mut one = pr(1, "Fix bug", "2026-01-01T00:00:00Z", false);
+        one.url = "https://github.com/o/r/pull/1".into();
+        let mut two = pr(2, "Add feature", "2026-05-01T00:00:00Z", false);
+        two.url = "https://github.com/o/r/pull/2".into();
+        let mut list = list_with(vec![one, two]);
+        list.accounts = Load::Ready(vec![Account::for_test("me")]);
+        assert_eq!(
+            list.dash_list_text().unwrap(),
+            "- Add feature — https://github.com/o/r/pull/2",
+            "nothing marked: the selected PR"
+        );
+        assert_eq!(list.toggle_mark(), Some(true));
+        list.selected = 1;
+        assert_eq!(list.toggle_mark(), Some(true));
+        assert_eq!(
+            list.dash_list_text().unwrap(),
+            "- Add feature — https://github.com/o/r/pull/2\n- Fix bug — https://github.com/o/r/pull/1"
+        );
+        assert_eq!(list.toggle_mark(), Some(false));
+        assert_eq!(list.marked.len(), 1);
+        assert!(list.is_marked(list.rows()[0].1));
     }
 
     #[test]
