@@ -206,7 +206,10 @@ impl Workspace {
         }
         let mut out = HashMap::new();
         for member in self.members.iter() {
-            let Ok(diff) = member.repo.unified_diff(&self.member_mode(member, mode), None) else {
+            let Ok(diff) = member
+                .repo
+                .unified_diff(&self.member_mode(member, mode), None)
+            else {
                 continue;
             };
             out.extend(
@@ -354,7 +357,14 @@ mod tests {
         let status = Command::new("git")
             .arg("-C")
             .arg(dir)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "init.defaultBranch=main",
+            ])
             .args(args)
             .output()
             .expect("run git");
@@ -396,7 +406,10 @@ mod tests {
 
         let lines = ws.changed_lines(&DiffMode::WorkingTree).unwrap();
         assert_eq!(lines["a/f.txt"], vec!["a".to_string()]);
-        assert!(ws.unified_diff(&DiffMode::WorkingTree, "b/f.txt").unwrap().contains("+b"));
+        assert!(ws
+            .unified_diff(&DiffMode::WorkingTree, "b/f.txt")
+            .unwrap()
+            .contains("+b"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -442,7 +455,10 @@ mod tests {
                 .map(|r| {
                     let root = root.canonicalize().unwrap();
                     let path = r.root().canonicalize().unwrap();
-                    path.strip_prefix(&root).unwrap().to_string_lossy().into_owned()
+                    path.strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
                 })
                 .collect()
         };

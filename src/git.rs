@@ -310,7 +310,9 @@ impl GitRepo {
             }
             DiffMode::WorkingTree => self.show("HEAD", old_path),
             DiffMode::Staged => self.show("HEAD", old_path),
-            DiffMode::Unstaged => self.show(":0", old_path).or_else(|| self.show(":", old_path)),
+            DiffMode::Unstaged => self
+                .show(":0", old_path)
+                .or_else(|| self.show(":", old_path)),
         }
     }
 

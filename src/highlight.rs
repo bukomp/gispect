@@ -167,7 +167,10 @@ mod tests {
             ("f.py", "def g(x): return None  # c\n"),
             ("f.go", "func f() int { return 1 } // c\n"),
             ("f.toml", "[table]\nkey = \"value\"\n"),
-            ("f.vue", "<template><div :class=\"x\">{{ y }}</div></template>\n"),
+            (
+                "f.vue",
+                "<template><div :class=\"x\">{{ y }}</div></template>\n",
+            ),
         ];
         for (path, text) in cases {
             assert!(

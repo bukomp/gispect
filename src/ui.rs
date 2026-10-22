@@ -75,7 +75,10 @@ fn draw_status_bar(f: &mut Frame, app: &App, area: Rect) {
     if let Ok(state) = app.update_state.lock() {
         match &*state {
             crate::app::UpdateState::Available(hash) => spans.push(Span::styled(
-                format!("  UPDATE AVAILABLE: {} (press U)", &hash[..hash.len().min(7)]),
+                format!(
+                    "  UPDATE AVAILABLE: {} (press U)",
+                    &hash[..hash.len().min(7)]
+                ),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -274,9 +277,15 @@ fn marker_span(status: &FileStatus) -> Span<'static> {
 fn count_spans(entry: &crate::types::FileEntry) -> Vec<Span<'static>> {
     vec![
         Span::raw("  "),
-        Span::styled(format!("+{}", entry.additions), Style::default().fg(Color::Green)),
+        Span::styled(
+            format!("+{}", entry.additions),
+            Style::default().fg(Color::Green),
+        ),
         Span::raw(" "),
-        Span::styled(format!("-{}", entry.deletions), Style::default().fg(Color::Red)),
+        Span::styled(
+            format!("-{}", entry.deletions),
+            Style::default().fg(Color::Red),
+        ),
     ]
 }
 
@@ -304,8 +313,14 @@ fn list_rows(app: &App) -> Vec<FileRow<'static>> {
 /// A node of the file-panel tree: a directory with children, or a leaf
 /// file carrying its index into `app.files`.
 enum TreeNode {
-    Dir { name: String, children: Vec<TreeNode> },
-    File { idx: usize, name: String },
+    Dir {
+        name: String,
+        children: Vec<TreeNode>,
+    },
+    File {
+        idx: usize,
+        name: String,
+    },
 }
 
 /// Tree view: directories and files rendered with `tree`-style ASCII
@@ -448,7 +463,13 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, r)| if is_left { r.left.is_some() } else { r.right.is_some() })
+            .filter(|(_, r)| {
+                if is_left {
+                    r.left.is_some()
+                } else {
+                    r.right.is_some()
+                }
+            })
             .collect()
     } else {
         app.diff.rows.iter().enumerate().collect()
@@ -471,9 +492,7 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
                     (RowKind::Added, false) => {
                         Span::styled("A ", Style::default().fg(Color::Green))
                     }
-                    (RowKind::Removed, true) => {
-                        Span::styled("D ", Style::default().fg(Color::Red))
-                    }
+                    (RowKind::Removed, true) => Span::styled("D ", Style::default().fg(Color::Red)),
                     (RowKind::Modified, _) => {
                         Span::styled("M ", Style::default().fg(Color::Yellow))
                     }
@@ -484,10 +503,7 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
                 let side = if is_left { Side::Left } else { Side::Right };
                 let marker = if app.has_draft(side, c.line_no) {
                     let letter = marker.content.chars().next().unwrap_or(' ');
-                    Span::styled(
-                        format!("{letter}●"),
-                        marker.style.fg(Color::Magenta),
-                    )
+                    Span::styled(format!("{letter}●"), marker.style.fg(Color::Magenta))
                 } else {
                     marker
                 };
@@ -596,7 +612,11 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
         };
 
         let content_width = width.saturating_sub(line_no_str.len() + marker.width());
-        let h_scroll = if is_left { app.h_scroll_old } else { app.h_scroll_new };
+        let h_scroll = if is_left {
+            app.h_scroll_old
+        } else {
+            app.h_scroll_new
+        };
         let sliced = slice_segments(&segments, h_scroll, content_width);
 
         // The PR review comment cursor shows as an inverted line number.
@@ -606,7 +626,11 @@ fn draw_diff_pane(f: &mut Frame, app: &mut App, area: Rect, is_left: bool) {
             Style::default().add_modifier(Modifier::DIM)
         };
         let mut spans = vec![Span::styled(line_no_str, line_no_style), marker];
-        spans.extend(sliced.into_iter().map(|(style, text)| Span::styled(text, style)));
+        spans.extend(
+            sliced
+                .into_iter()
+                .map(|(style, text)| Span::styled(text, style)),
+        );
 
         lines.push(Line::from(spans));
     }
@@ -687,9 +711,8 @@ fn overlay_ranges(
             while range_idx < ranges.len() && ranges[range_idx].1 <= pos {
                 range_idx += 1;
             }
-            let in_range = range_idx < ranges.len()
-                && ranges[range_idx].0 <= pos
-                && pos < ranges[range_idx].1;
+            let in_range =
+                range_idx < ranges.len() && ranges[range_idx].0 <= pos && pos < ranges[range_idx].1;
             let run_style = if in_range { style.patch(patch) } else { *style };
             // Find how far this run extends within the current segment,
             // stopping at the next range boundary or segment end.
@@ -776,7 +799,12 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let height = (text.len() as u16 + 2).min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let popup = Rect { x, y, width, height };
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
 
     f.render_widget(Clear, popup);
 
@@ -795,7 +823,12 @@ fn draw_config_modal(f: &mut Frame, app: &App, area: Rect) {
     let height = 12u16.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let popup = Rect { x, y, width, height };
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
 
     f.render_widget(Clear, popup);
 

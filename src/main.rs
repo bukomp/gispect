@@ -25,7 +25,11 @@ use crate::types::DiffMode;
 use crate::workspace::Workspace;
 
 #[derive(Parser)]
-#[command(name = "gispect", version, about = "Inspect git diffs in a side-by-side TUI")]
+#[command(
+    name = "gispect",
+    version,
+    about = "Inspect git diffs in a side-by-side TUI"
+)]
 struct Cli {
     /// Base branch for branch comparison (defaults to main/master).
     #[arg(short, long)]

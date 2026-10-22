@@ -8,8 +8,8 @@ use std::io::{self, BufRead, Write};
 
 use serde_json::{json, Value};
 
-use crate::workspace::Workspace;
 use crate::types::{DiffMode, FileEntry, FileStatus};
+use crate::workspace::Workspace;
 
 /// Run the MCP server, blocking on stdin until EOF.
 pub fn run(repo: Workspace) -> anyhow::Result<()> {
@@ -263,7 +263,9 @@ fn run_diff_summary(repo: &Workspace, arguments: &Value) -> Value {
             for entry in &entries {
                 additions += entry.additions;
                 deletions += entry.deletions;
-                *by_status.entry(file_status_marker(&entry.status)).or_insert(0) += 1;
+                *by_status
+                    .entry(file_status_marker(&entry.status))
+                    .or_insert(0) += 1;
             }
 
             let summary = json!({

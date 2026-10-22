@@ -1209,7 +1209,9 @@ mod tests {
 
     #[test]
     fn scoped_queries_chunk_repos() {
-        let repos: Vec<String> = (0..REPOS_PER_QUERY + 1).map(|i| format!("o/r{i}")).collect();
+        let repos: Vec<String> = (0..REPOS_PER_QUERY + 1)
+            .map(|i| format!("o/r{i}"))
+            .collect();
         let queries = scoped_queries("is:pr", &repos);
         assert_eq!(queries.len(), 2);
         assert!(queries[0].starts_with("is:pr repo:o/r0 repo:o/r1 "));

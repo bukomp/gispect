@@ -46,7 +46,9 @@ pub enum FileStatus {
     Modified,
     Deleted,
     /// Renamed; `from` is the old path (the entry's `path` is the new one).
-    Renamed { from: String },
+    Renamed {
+        from: String,
+    },
     /// Any other status letter git reports (C, T, U, ...).
     Other(char),
 }

@@ -22,11 +22,11 @@ use ratatui::Terminal;
 use crate::actions;
 use crate::config;
 use crate::gh::{self, Side};
-use crate::workspace::Workspace;
 use crate::highlight::{self, HlLines};
 use crate::pr::{self, Load, PrEvent};
 use crate::search;
 use crate::types::{DiffMode, FileEntry, FileStatus, RowKind, SideBySideDiff};
+use crate::workspace::Workspace;
 use crate::{clipboard, diff, update};
 
 /// How long a footer notification stays visible before the shortcut
@@ -662,8 +662,14 @@ impl App {
         if !self.compact {
             return idx;
         }
-        let left = self.diff.rows[..idx].iter().filter(|r| r.left.is_some()).count();
-        let right = self.diff.rows[..idx].iter().filter(|r| r.right.is_some()).count();
+        let left = self.diff.rows[..idx]
+            .iter()
+            .filter(|r| r.left.is_some())
+            .count();
+        let right = self.diff.rows[..idx]
+            .iter()
+            .filter(|r| r.right.is_some())
+            .count();
         match (self.show_old, self.show_new) {
             (true, false) => left,
             (false, true) => right,
@@ -2104,7 +2110,9 @@ impl App {
         let target = if pos < top {
             (0..n).find(|&i| self.row_visible(i) && positions[i] >= top)
         } else {
-            (0..n).rev().find(|&i| self.row_visible(i) && positions[i] < top + height)
+            (0..n)
+                .rev()
+                .find(|&i| self.row_visible(i) && positions[i] < top + height)
         };
         if let Some(i) = target {
             self.cursor = i;
@@ -2113,7 +2121,11 @@ impl App {
 
     /// Put the comment cursor on the diff row clicked in one pane.
     fn click_diff_row(&mut self, row: u16, left: bool) {
-        let area = if left { self.old_pane_area } else { self.new_pane_area };
+        let area = if left {
+            self.old_pane_area
+        } else {
+            self.new_pane_area
+        };
         let Some(offset) = row.checked_sub(area.y) else {
             return;
         };
@@ -2123,7 +2135,13 @@ impl App {
                 .rows
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| if left { r.left.is_some() } else { r.right.is_some() })
+                .filter(|(_, r)| {
+                    if left {
+                        r.left.is_some()
+                    } else {
+                        r.right.is_some()
+                    }
+                })
                 .nth(visible)
                 .map(|(i, _)| i)
         } else {
@@ -2199,7 +2217,10 @@ impl App {
             return;
         };
         let body = editor.buffer.text.trim_end().to_string();
-        let msg = match (session.draft_at(&editor.path, editor.side, editor.line), body.is_empty()) {
+        let msg = match (
+            session.draft_at(&editor.path, editor.side, editor.line),
+            body.is_empty(),
+        ) {
             (Some(i), true) => {
                 session.drafts.remove(i);
                 "draft comment removed"
@@ -2473,10 +2494,7 @@ fn spawn_update_check(slot: Arc<Mutex<UpdateState>>) {
     });
 }
 
-fn event_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> Result<()> {
+fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| {
             app.last_viewport_height = f.area().height as usize;

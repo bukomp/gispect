@@ -126,11 +126,7 @@ pub fn run_cli() -> Result<()> {
             return Ok(());
         }
         Some(remote) => {
-            println!(
-                "updating {} -> {}",
-                short(current_commit()),
-                short(&remote)
-            );
+            println!("updating {} -> {}", short(current_commit()), short(&remote));
         }
     }
 

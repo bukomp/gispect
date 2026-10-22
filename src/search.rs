@@ -228,7 +228,9 @@ pub fn any_line_matches(lines: &[String], query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
-    lines.iter().any(|line| !match_ranges(line, query).is_empty())
+    lines
+        .iter()
+        .any(|line| !match_ranges(line, query).is_empty())
 }
 
 /// Overlay `style` (via `Style::patch`) on every occurrence of `query`
@@ -507,7 +509,9 @@ index abc1234..def5678 100644
     #[test]
     fn parse_changed_lines_modified_file_strips_only_marker_char() {
         let parsed = parse_changed_lines(MULTI_FILE_DIFF);
-        let lib = parsed.get("src/lib.rs").expect("src/lib.rs should have changed lines");
+        let lib = parsed
+            .get("src/lib.rs")
+            .expect("src/lib.rs should have changed lines");
         assert_eq!(
             lib,
             &vec![
@@ -521,7 +525,9 @@ index abc1234..def5678 100644
     #[test]
     fn parse_changed_lines_added_file_keyed_by_new_path() {
         let parsed = parse_changed_lines(MULTI_FILE_DIFF);
-        let new_file = parsed.get("new.rs").expect("new.rs should have changed lines");
+        let new_file = parsed
+            .get("new.rs")
+            .expect("new.rs should have changed lines");
         assert_eq!(
             new_file,
             &vec!["fn added() {}".to_string(), "// new file".to_string()]
@@ -531,7 +537,9 @@ index abc1234..def5678 100644
     #[test]
     fn parse_changed_lines_deleted_file_keyed_by_pre_change_path() {
         let parsed = parse_changed_lines(MULTI_FILE_DIFF);
-        let gone = parsed.get("gone.rs").expect("gone.rs should have changed lines");
+        let gone = parsed
+            .get("gone.rs")
+            .expect("gone.rs should have changed lines");
         assert_eq!(
             gone,
             &vec!["fn removed() {}".to_string(), "// bye".to_string()]
@@ -551,14 +559,18 @@ index abc1234..def5678 100644
         // Neither the "--- a/..." / "+++ b/..." header lines nor the
         // "@@ ... @@" hunk header should show up as changed-line content.
         assert!(!lib.iter().any(|l| l.contains("@@")));
-        assert!(!lib.iter().any(|l| l.starts_with("- a/") || l.starts_with("+ b/")));
+        assert!(!lib
+            .iter()
+            .any(|l| l.starts_with("- a/") || l.starts_with("+ b/")));
         assert!(!lib.contains(&"context line".to_string()));
     }
 
     #[test]
     fn parse_changed_lines_skips_no_newline_marker() {
         let parsed = parse_changed_lines(MULTI_FILE_DIFF);
-        let nonl = parsed.get("nonl.rs").expect("nonl.rs should have changed lines");
+        let nonl = parsed
+            .get("nonl.rs")
+            .expect("nonl.rs should have changed lines");
         assert_eq!(nonl, &vec!["old".to_string(), "new".to_string()]);
     }
 
@@ -617,7 +629,11 @@ index abc1234..def5678 100644
         for (style, text) in &result {
             let is_within_hello = consumed < 5;
             if is_within_hello {
-                assert_eq!(style.bg, Some(Color::Yellow), "piece {text:?} should be highlighted");
+                assert_eq!(
+                    style.bg,
+                    Some(Color::Yellow),
+                    "piece {text:?} should be highlighted"
+                );
             } else {
                 assert_eq!(style.bg, None, "piece {text:?} should not be highlighted");
             }

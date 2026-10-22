@@ -157,14 +157,22 @@ impl Config {
 }
 
 fn bool_label(v: bool) -> String {
-    if v { "on".to_string() } else { "off".to_string() }
+    if v {
+        "on".to_string()
+    } else {
+        "off".to_string()
+    }
 }
 
 /// $XDG_CONFIG_HOME/gispect/config.json, else $HOME/.config/gispect/config.json; None if neither env var is set.
 pub fn config_path() -> Option<std::path::PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return Some(std::path::PathBuf::from(xdg).join("gispect").join("config.json"));
+            return Some(
+                std::path::PathBuf::from(xdg)
+                    .join("gispect")
+                    .join("config.json"),
+            );
         }
     }
     if let Some(home) = std::env::var_os("HOME") {
