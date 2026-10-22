@@ -994,7 +994,7 @@ fn fetch_repo(
     full_name: &str,
     root: &Path,
 ) -> Result<RepoData, String> {
-    let host = resolve_host(accounts, host)
+    let host = gh::resolve_host(accounts, host)
         .ok_or_else(|| format!("no gh account for {host} (run `gh auth login`)"))?;
     let (account, access) = pick_account(accounts, &host, full_name)?;
     let workflows = gh::workflows(&account, full_name).map_err(|e| e.to_string())?;
@@ -1018,21 +1018,6 @@ fn fetch_repo(
         runs,
         runs_error,
     })
-}
-
-/// The account host a remote host stands for: itself, or the real
-/// hostname of an SSH alias (`git@work-gh:o/r` → `github.com`). GitHub's
-/// SSH-over-443 endpoint `ssh.github.com` counts as `github.com`.
-fn resolve_host(accounts: &[Account], host: &str) -> Option<String> {
-    let known = |h: &str| accounts.iter().any(|a| a.host == h);
-    let real = |h: &str| {
-        [Some(h), h.strip_prefix("ssh.")]
-            .into_iter()
-            .flatten()
-            .find(|h| known(h))
-            .map(str::to_string)
-    };
-    real(host).or_else(|| real(&gh::ssh_hostname(host)?))
 }
 
 /// The first account on `host` that may push to the repository, else the

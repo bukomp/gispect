@@ -159,6 +159,15 @@ It lists PRs for every account `gh` is logged in to, across hosts (github.com
 and GitHub Enterprise). Each request runs as that account by passing its token
 to `gh` through the environment, so the active `gh` account is never switched.
 
+Inside a repository, the list shows only PRs of that repository and of
+repositories nested below it (up to 3 folders deep, skipping hidden folders,
+`node_modules` and `target`). In a folder of repositories, it shows PRs of the
+repositories below that folder. Every remote counts, so PRs to a fork's
+upstream show too. Remotes on a host no `gh` account is logged in to are
+ignored; when no remote is left (or outside any repository), the list shows
+all PRs. `w` switches between local repositories and all PRs, and the status
+line shows `repos: owner/name`, `repos: n local` or `repos: all`.
+
 Tabs: Review requested (`review-requested:@me`), Authored, Assigned, Involved.
 Results are the 50 most recently updated per account and tab, cached until
 refreshed. Rows show state (● open/merged/closed, ◌ draft), `repo#number`,
@@ -180,6 +189,7 @@ requests per file).
 | `g` / `G` | top / bottom |
 | `Tab` / `Shift-Tab`, `1`–`4` | switch tab |
 | `a` | cycle account filter (all / one account) |
+| `w` | local repositories only / all PRs |
 | `s` | cycle state (open / closed / merged / all) |
 | `d` | hide / show drafts |
 | `/` | text filter over title, repo, author, branch and `#number` (smart-case, live; `Enter` keeps, `Esc` clears) |

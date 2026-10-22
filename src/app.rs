@@ -1409,7 +1409,7 @@ impl App {
     fn open_pr_list(&mut self) {
         if self.pr_list.is_none() {
             self.pr_list = Some(pr::PrList::new());
-            pr::spawn_accounts(self.pr_tx.clone());
+            pr::spawn_accounts(self.pr_tx.clone(), self.workspace.clone());
         }
         self.pr_list_open = true;
         self.start_list_queries();
@@ -1427,7 +1427,8 @@ impl App {
         for key in list.missing_queries() {
             if let Some(account) = list.account_list().get(key.0).cloned() {
                 list.results.insert(key, Load::Loading);
-                pr::spawn_search(self.pr_tx.clone(), key, account);
+                let repos = list.scope_for(&account);
+                pr::spawn_search(self.pr_tx.clone(), key, account, repos);
             }
         }
         list.clamp_selection();
@@ -1462,11 +1463,13 @@ impl App {
     pub(crate) fn poll_pr_events(&mut self) {
         while let Ok(event) = self.pr_rx.try_recv() {
             match event {
-                PrEvent::Accounts(result) => {
-                    self.list_mut().accounts = match result {
+                PrEvent::Accounts { result, scope } => {
+                    let list = self.list_mut();
+                    list.accounts = match result {
                         Ok(accounts) => Load::Ready(accounts),
                         Err(e) => Load::Failed(e),
                     };
+                    list.scope = scope;
                     self.start_list_queries();
                 }
                 PrEvent::List { key, result } => {
@@ -1858,6 +1861,15 @@ impl App {
                 list.hide_drafts = !list.hide_drafts;
                 list.clamp_selection();
             }
+            KeyCode::Char('w') => {
+                if list.scope.is_none() {
+                    self.set_status("no local GitHub repositories to limit the list to");
+                    return;
+                }
+                list.scoped = !list.scoped;
+                list.selected = 0;
+                self.start_list_queries();
+            }
             KeyCode::Char('/') => {
                 list.filter_input = Some(list.text_filter.clone().unwrap_or_default());
             }
@@ -1865,7 +1877,7 @@ impl App {
                 list.invalidate(None);
                 if matches!(list.accounts, Load::Failed(_)) {
                     list.accounts = Load::Loading;
-                    pr::spawn_accounts(self.pr_tx.clone());
+                    pr::spawn_accounts(self.pr_tx.clone(), self.workspace.clone());
                 }
                 self.start_list_queries();
                 self.set_status("refreshing…");

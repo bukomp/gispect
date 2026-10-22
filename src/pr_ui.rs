@@ -58,8 +58,13 @@ fn draw_list_status(f: &mut Frame, list: &PrList, statuses: &[Option<PreloadStat
                 .join(", "),
         },
     };
+    let repos = match list.active_scope() {
+        Some([(_, repo)]) => repo.clone(),
+        Some(scope) => format!("{} local", scope.len()),
+        None => "all".to_string(),
+    };
     let mut text = format!(
-        " gispect | pull requests | accounts: {accounts} | state: {} | drafts: {}",
+        " gispect | pull requests | accounts: {accounts} | repos: {repos} | state: {} | drafts: {}",
         list.state.label(),
         if list.hide_drafts { "hidden" } else { "shown" }
     );
@@ -331,7 +336,7 @@ fn draw_list_footer(f: &mut Frame, list: &PrList, status: Option<String>, area: 
         ))
     } else {
         Line::from(Span::styled(
-            " Enter review  Tab/1-4 tab  a account  s state  d drafts  / filter  o browser  r refresh  Esc back  q quit",
+            " Enter review  Tab/1-4 tab  a account  w repos  s state  d drafts  / filter  o browser  r refresh  Esc back  q quit",
             DIM,
         ))
     };

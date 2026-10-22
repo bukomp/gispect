@@ -975,6 +975,21 @@ pub fn ssh_hostname(alias: &str) -> Option<String> {
         .filter(|h| valid_host(h))
 }
 
+/// The account host a remote host stands for: itself, or the real
+/// hostname of an SSH alias (`git@work-gh:o/r` → `github.com`). GitHub's
+/// SSH-over-443 endpoint `ssh.github.com` counts as `github.com`.
+pub fn resolve_host(accounts: &[Account], host: &str) -> Option<String> {
+    let known = |h: &str| accounts.iter().any(|a| a.host == h);
+    let real = |h: &str| {
+        [Some(h), h.strip_prefix("ssh.")]
+            .into_iter()
+            .flatten()
+            .find(|h| known(h))
+            .map(str::to_string)
+    };
+    real(host).or_else(|| real(&ssh_hostname(host)?))
+}
+
 /// `owner/name` with only the characters GitHub allows in each part.
 fn valid_repo(repo: &str) -> bool {
     let mut parts = repo.split('/');

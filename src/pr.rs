@@ -1,12 +1,12 @@
 //! Pull request view state: the PR list (tabs, account/state/draft/text
-//! filters and a per-query result cache), the per-PR review session
+//! filters, the local-repository scope and a per-query result cache), the per-PR review session
 //! (fetched files, cached contents, draft inline comments), the comment
 //! and review editors, the background preloader that fetches the PRs of
 //! the open list tab ahead of time, and the background `gh` jobs feeding
 //! them through one event channel. Rendering lives in `pr_ui.rs`, key handling in
 //! `app.rs`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +14,7 @@ use crate::gh::{self, Account, DraftComment, PrDetails, PrSummary, ReviewEvent, 
 use crate::git::GitRepo;
 use crate::search;
 use crate::types::{FileEntry, FileStatus};
+use crate::workspace::Workspace;
 
 /// Which search a list tab runs, relative to each account (`@me`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -114,8 +115,28 @@ pub fn search_query(tab: PrTab, state: StateFilter) -> String {
     q
 }
 
-/// One search, per account: results are cached under this key.
-pub type QueryKey = (usize, PrTab, StateFilter);
+/// Repositories per search; a scope with more is split over several.
+const REPOS_PER_QUERY: usize = 20;
+
+/// `base` limited to `repos` (`owner/name`), one search string per chunk
+/// of [`REPOS_PER_QUERY`] repositories.
+pub fn scoped_queries(base: &str, repos: &[String]) -> Vec<String> {
+    repos
+        .chunks(REPOS_PER_QUERY)
+        .map(|chunk| {
+            let mut q = base.to_string();
+            for repo in chunk {
+                q.push_str(" repo:");
+                q.push_str(repo);
+            }
+            q
+        })
+        .collect()
+}
+
+/// One search, per account, and whether it is limited to the local
+/// repositories: results are cached under this key.
+pub type QueryKey = (usize, PrTab, StateFilter, bool);
 
 /// A value fetched in the background.
 #[derive(Debug, Clone)]
@@ -127,7 +148,11 @@ pub enum Load<T> {
 
 /// Results of background `gh` jobs, drained by the UI thread.
 pub enum PrEvent {
-    Accounts(Result<Vec<Account>, String>),
+    Accounts {
+        result: Result<Vec<Account>, String>,
+        /// See [`PrList::scope`].
+        scope: Option<Vec<(String, String)>>,
+    },
     List {
         key: QueryKey,
         result: Result<Vec<PrSummary>, String>,
@@ -166,6 +191,12 @@ pub struct PrList {
     pub state: StateFilter,
     /// Account index to show; `None` shows every account.
     pub account_filter: Option<usize>,
+    /// GitHub repositories (account host, `owner/name`) of the local
+    /// workspace; `None` outside one or when none of its remotes is on a
+    /// logged-in host.
+    pub scope: Option<Vec<(String, String)>>,
+    /// Show only PRs of `scope`'s repositories (when there is a scope).
+    pub scoped: bool,
     pub hide_drafts: bool,
     /// Committed text filter over title, repo, author, branch and number.
     pub text_filter: Option<String>,
@@ -185,6 +216,8 @@ impl PrList {
             tab: PrTab::ReviewRequested,
             state: StateFilter::Open,
             account_filter: None,
+            scope: None,
+            scoped: true,
             hide_drafts: false,
             text_filter: None,
             filter_input: None,
@@ -210,6 +243,28 @@ impl PrList {
         }
     }
 
+    /// The repositories searches are limited to, if any.
+    pub fn active_scope(&self) -> Option<&[(String, String)]> {
+        self.scope.as_deref().filter(|_| self.scoped)
+    }
+
+    /// Cache key of `tab`'s search for account `a` in the current view.
+    fn key(&self, a: usize, tab: PrTab) -> QueryKey {
+        (a, tab, self.state, self.active_scope().is_some())
+    }
+
+    /// Repositories (`owner/name`) on `account`'s host that its search is
+    /// limited to; `None` when unscoped.
+    pub fn scope_for(&self, account: &Account) -> Option<Vec<String>> {
+        self.active_scope().map(|scope| {
+            scope
+                .iter()
+                .filter(|(host, _)| *host == account.host)
+                .map(|(_, repo)| repo.clone())
+                .collect()
+        })
+    }
+
     /// The text filter in effect: live prompt text, else the committed one.
     pub fn active_text_filter(&self) -> Option<&str> {
         self.filter_input
@@ -222,7 +277,7 @@ impl PrList {
     pub fn missing_queries(&self) -> Vec<QueryKey> {
         self.shown_accounts()
             .into_iter()
-            .map(|a| (a, self.tab, self.state))
+            .map(|a| self.key(a, self.tab))
             .filter(|k| !self.results.contains_key(k))
             .collect()
     }
@@ -234,7 +289,7 @@ impl PrList {
         let mut rows: Vec<(usize, &PrSummary)> = self
             .shown_accounts()
             .into_iter()
-            .filter_map(|a| match self.results.get(&(a, tab, self.state)) {
+            .filter_map(|a| match self.results.get(&self.key(a, tab)) {
                 Some(Load::Ready(prs)) => Some(prs.iter().map(move |pr| (a, pr))),
                 _ => None,
             })
@@ -256,7 +311,7 @@ impl PrList {
         matches!(self.accounts, Load::Loading)
             || self.shown_accounts().into_iter().any(|a| {
                 matches!(
-                    self.results.get(&(a, tab, self.state)),
+                    self.results.get(&self.key(a, tab)),
                     Some(Load::Loading) | None
                 )
             })
@@ -267,7 +322,7 @@ impl PrList {
         let accounts = self.account_list();
         self.shown_accounts()
             .into_iter()
-            .filter_map(|a| match self.results.get(&(a, self.tab, self.state)) {
+            .filter_map(|a| match self.results.get(&self.key(a, self.tab)) {
                 Some(Load::Failed(e)) => Some((
                     accounts.get(a).map(Account::label).unwrap_or_default(),
                     e.clone(),
@@ -483,19 +538,85 @@ impl ReviewModal {
     }
 }
 
-/// Load every gh account (with tokens) in the background.
-pub fn spawn_accounts(tx: mpsc::Sender<PrEvent>) {
+/// Load every gh account (with tokens) in the background, along with
+/// the GitHub repositories of `workspace` the list is scoped to.
+pub fn spawn_accounts(tx: mpsc::Sender<PrEvent>, workspace: Option<Workspace>) {
     std::thread::spawn(move || {
-        let result = gh::accounts().map_err(|e| e.to_string());
-        let _ = tx.send(PrEvent::Accounts(result));
+        let (result, remotes) = std::thread::scope(|s| {
+            let remotes = s.spawn(|| workspace.as_ref().map(local_remotes));
+            let result = gh::accounts().map_err(|e| e.to_string());
+            (result, remotes.join().ok().flatten())
+        });
+        let scope = match (&result, remotes) {
+            (Ok(accounts), Some(remotes)) => resolve_scope(accounts, remotes),
+            _ => None,
+        };
+        let _ = tx.send(PrEvent::Accounts { result, scope });
     });
 }
 
-/// Run one list search in the background.
-pub fn spawn_search(tx: mpsc::Sender<PrEvent>, key: QueryKey, account: Account) {
+/// `(host, owner/name)` of every GitHub-style remote of the workspace's
+/// repositories and those nested below it. All remotes count, so PRs to
+/// a fork's upstream show too.
+fn local_remotes(workspace: &Workspace) -> BTreeSet<(String, String)> {
+    workspace
+        .scope_repos()
+        .iter()
+        .flat_map(|repo| repo.remote_urls())
+        .filter_map(|url| gh::parse_remote(&url))
+        .collect()
+}
+
+/// `remotes` with hosts mapped to account hosts (resolving SSH aliases);
+/// remotes on no logged-in host are dropped. `None` when none remain.
+fn resolve_scope(
+    accounts: &[Account],
+    remotes: BTreeSet<(String, String)>,
+) -> Option<Vec<(String, String)>> {
+    let mut hosts: HashMap<String, Option<String>> = HashMap::new();
+    let scope: BTreeSet<(String, String)> = remotes
+        .into_iter()
+        .filter_map(|(host, repo)| {
+            let resolved = hosts
+                .entry(host)
+                .or_insert_with_key(|h| gh::resolve_host(accounts, h))
+                .clone()?;
+            Some((resolved, repo))
+        })
+        .collect();
+    (!scope.is_empty()).then(|| scope.into_iter().collect())
+}
+
+/// Run one list search in the background, limited to `repos` when
+/// given. An empty `repos` (nothing on the account's host) finds nothing
+/// without asking GitHub.
+pub fn spawn_search(
+    tx: mpsc::Sender<PrEvent>,
+    key: QueryKey,
+    account: Account,
+    repos: Option<Vec<String>>,
+) {
     std::thread::spawn(move || {
-        let query = search_query(key.1, key.2);
-        let result = gh::search_prs(&account, &query).map_err(|e| e.to_string());
+        let base = search_query(key.1, key.2);
+        let queries = match &repos {
+            Some(repos) => scoped_queries(&base, repos),
+            None => vec![base],
+        };
+        let mut prs = Vec::new();
+        let mut error = None;
+        for query in &queries {
+            match gh::search_prs(&account, query) {
+                Ok(found) => prs.extend(found),
+                Err(e) => {
+                    error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        let result = match error {
+            Some(e) => Err(e),
+            None => Ok(prs),
+        };
         let _ = tx.send(PrEvent::List { key, result });
     });
 }
@@ -1001,7 +1122,7 @@ mod tests {
         list.accounts = Load::Ready(Vec::new());
         list.account_filter = Some(0);
         list.results.insert(
-            (0, PrTab::ReviewRequested, StateFilter::Open),
+            (0, PrTab::ReviewRequested, StateFilter::Open, false),
             Load::Ready(prs),
         );
         list
@@ -1017,6 +1138,31 @@ mod tests {
             search_query(PrTab::Authored, StateFilter::All),
             "is:pr author:@me archived:false sort:updated-desc"
         );
+    }
+
+    #[test]
+    fn scoped_queries_chunk_repos() {
+        let repos: Vec<String> = (0..REPOS_PER_QUERY + 1).map(|i| format!("o/r{i}")).collect();
+        let queries = scoped_queries("is:pr", &repos);
+        assert_eq!(queries.len(), 2);
+        assert!(queries[0].starts_with("is:pr repo:o/r0 repo:o/r1 "));
+        assert_eq!(queries[1], format!("is:pr repo:o/r{REPOS_PER_QUERY}"));
+        assert!(scoped_queries("is:pr", &[]).is_empty());
+    }
+
+    #[test]
+    fn scope_limits_searches_per_host() {
+        let mut list = PrList::new();
+        let account = Account::for_test("me");
+        list.scope = Some(vec![
+            (account.host.clone(), "o/a".to_string()),
+            ("ghe.corp".to_string(), "o/b".to_string()),
+        ]);
+        assert_eq!(list.scope_for(&account), Some(vec!["o/a".to_string()]));
+        assert!(list.key(0, PrTab::Authored).3);
+        list.scoped = false;
+        assert_eq!(list.scope_for(&account), None);
+        assert!(!list.key(0, PrTab::Authored).3);
     }
 
     #[test]

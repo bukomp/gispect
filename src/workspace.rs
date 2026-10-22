@@ -5,8 +5,8 @@
 //! folder name (`kanbu/src/main.rs`), so the merged file list groups by
 //! repository in the tree view and paths stay unique.
 
-use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
@@ -27,7 +27,15 @@ struct Member {
 #[derive(Clone)]
 pub struct Workspace {
     members: std::sync::Arc<Vec<Member>>,
+    /// The repository root, or the folder holding the repositories.
+    root: PathBuf,
 }
+
+/// Folder levels below the workspace root searched for nested
+/// repositories (see [`Workspace::scope_repos`]).
+const NESTED_DEPTH: usize = 3;
+/// Folders never searched for nested repositories.
+const SKIP_DIRS: [&str; 2] = ["node_modules", "target"];
 
 impl Workspace {
     /// The repository containing `path`; failing that, every repository
@@ -35,11 +43,15 @@ impl Workspace {
     pub fn discover(path: &Path) -> Result<Self> {
         if let Ok(repo) = GitRepo::discover(path) {
             let branch = repo.current_branch();
-            return Ok(Self::from_members(vec![Member {
-                name: String::new(),
-                repo,
-                branch,
-            }]));
+            let root = repo.root().to_path_buf();
+            return Ok(Self::from_members(
+                vec![Member {
+                    name: String::new(),
+                    repo,
+                    branch,
+                }],
+                root,
+            ));
         }
         let mut members: Vec<Member> = std::fs::read_dir(path)
             .into_iter()
@@ -62,12 +74,13 @@ impl Workspace {
             );
         }
         members.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Self::from_members(members))
+        Ok(Self::from_members(members, path.to_path_buf()))
     }
 
-    fn from_members(members: Vec<Member>) -> Self {
+    fn from_members(members: Vec<Member>, root: PathBuf) -> Self {
         Workspace {
             members: std::sync::Arc::new(members),
+            root,
         }
     }
 
@@ -238,6 +251,23 @@ impl Workspace {
             .collect()
     }
 
+    /// Every repository at or below the workspace root: the members, then
+    /// repositories nested up to [`NESTED_DEPTH`] folders below the root
+    /// (submodules, clones inside a repository or a grouping folder).
+    /// Hidden folders, `node_modules` and `target` are not searched.
+    pub fn scope_repos(&self) -> Vec<GitRepo> {
+        let mut repos: Vec<GitRepo> = self.members.iter().map(|m| m.repo.clone()).collect();
+        let mut seen: HashSet<PathBuf> = repos.iter().map(|r| r.root().to_path_buf()).collect();
+        for dir in repo_dirs_below(&self.root, NESTED_DEPTH) {
+            if let Ok(repo) = GitRepo::discover(&dir) {
+                if seen.insert(repo.root().to_path_buf()) {
+                    repos.push(repo);
+                }
+            }
+        }
+        repos
+    }
+
     /// Local clone to read PR commits from: the repository itself, or in
     /// multi-repo mode the one whose folder matches the PR repository's
     /// name (`owner/name`). Commits it lacks are fetched from GitHub.
@@ -274,6 +304,36 @@ impl Workspace {
             _ => mode.clone(),
         }
     }
+}
+
+/// Folders up to `depth` levels below `root` that hold a `.git` entry,
+/// sorted. Symlinked folders are not followed.
+fn repo_dirs_below(root: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut level = vec![root.to_path_buf()];
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for dir in level {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.') || SKIP_DIRS.contains(&name.as_ref()) {
+                    continue;
+                }
+                let path = entry.path();
+                if path.join(".git").exists() {
+                    found.push(path.clone());
+                }
+                next.push(path);
+            }
+        }
+        level = next;
+    }
+    found.sort();
+    found
 }
 
 /// Prefix `entry`'s paths (including a rename source) with `name/`.
@@ -362,6 +422,35 @@ mod tests {
         let files = ws.changed_files(&DiffMode::WorkingTree).unwrap();
         assert_eq!(files[0].path, "f.txt");
         assert_eq!(ws.repo_label("f.txt"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scope_includes_nested_repos() {
+        let root = fixture("nested");
+        for nested in ["a/vendor/x", "group/c"] {
+            let dir = root.join(nested);
+            std::fs::create_dir_all(&dir).unwrap();
+            git(&dir, &["init", "-q"]);
+        }
+        let ignored = root.join("a/node_modules/y");
+        std::fs::create_dir_all(&ignored).unwrap();
+        git(&ignored, &["init", "-q"]);
+        let names = |ws: &Workspace| -> Vec<String> {
+            ws.scope_repos()
+                .iter()
+                .map(|r| {
+                    let root = root.canonicalize().unwrap();
+                    let path = r.root().canonicalize().unwrap();
+                    path.strip_prefix(&root).unwrap().to_string_lossy().into_owned()
+                })
+                .collect()
+        };
+
+        let single = Workspace::discover(&root.join("a")).unwrap();
+        assert_eq!(names(&single), ["a", "a/vendor/x"]);
+        let multi = Workspace::discover(&root).unwrap();
+        assert_eq!(names(&multi), ["a", "b", "a/vendor/x", "group/c"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
