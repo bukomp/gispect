@@ -32,6 +32,9 @@ const ACTIVE_POLL: Duration = Duration::from_secs(8);
 const WATCH_POLL: Duration = Duration::from_secs(3);
 /// How long to keep watching for a run that was just requested.
 const WATCH_FOR: Duration = Duration::from_secs(45);
+/// Refresh interval while only running runs are shown and none is, so
+/// runs started elsewhere show up.
+const RUNNING_POLL: Duration = Duration::from_secs(20);
 
 /// Whether and how a workflow can be started by hand.
 #[derive(Debug, Clone)]
@@ -144,14 +147,17 @@ impl RepoNode {
     }
 
     /// When to refresh runs next: often while a run is active or one was
-    /// just requested, else not at all (press `r`).
-    fn schedule_poll(&mut self) {
+    /// just requested, now and then while only running runs are shown
+    /// (`scan`), else not at all (press `r`).
+    fn schedule_poll(&mut self, scan: bool) {
         let now = Instant::now();
         let active = self.ready().is_some_and(|d| d.active_runs() > 0);
         self.next_poll = if active {
             Some(now + ACTIVE_POLL)
         } else if self.watch_until.is_some_and(|t| t > now) {
             Some(now + WATCH_POLL)
+        } else if scan && self.ready().is_some() {
+            Some(now + RUNNING_POLL)
         } else {
             None
         };
@@ -394,6 +400,8 @@ pub struct ActionsView {
     pub text_filter: Option<String>,
     /// Filter prompt being typed; filters live while typing.
     pub filter_input: Option<String>,
+    /// Show only queued and in-progress runs (and their workflows).
+    pub running_only: bool,
     pub modal: Option<RunModal>,
     pub batch_modal: Option<BatchModal>,
     /// Workflow and run rows marked with Space for group actions.
@@ -439,6 +447,7 @@ impl ActionsView {
             selected: None,
             text_filter: None,
             filter_input: None,
+            running_only: false,
             modal: None,
             batch_modal: None,
             marked: HashSet::new(),
@@ -568,7 +577,7 @@ impl ActionsView {
                         Ok(data) => Load::Ready(data),
                         Err(e) => Load::Failed(e),
                     };
-                    repo.schedule_poll();
+                    repo.schedule_poll(self.running_only);
                 }
                 ActionsEvent::Runs {
                     idx,
@@ -589,7 +598,7 @@ impl ActionsView {
                             Err(e) => data.runs_error = Some(e),
                         }
                     }
-                    repo.schedule_poll();
+                    repo.schedule_poll(self.running_only);
                 }
                 ActionsEvent::Dispatched {
                     idx,
@@ -754,10 +763,22 @@ impl ActionsView {
             .filter(|q| !q.is_empty())
     }
 
+    /// Whether repository `idx` shows what is under it: expanded, or
+    /// opened by a filter or by showing only running runs.
+    pub fn repo_open(&self, idx: usize) -> bool {
+        self.repos[idx].expanded || self.active_filter().is_some() || self.running_only
+    }
+
+    /// Whether a workflow's runs are listed.
+    pub fn workflow_open(&self, idx: usize, workflow: u64) -> bool {
+        self.running_only || self.repos[idx].open_workflows.contains(&workflow)
+    }
+
     /// Visible rows, top to bottom.
     pub fn rows(&self) -> Vec<RowKey> {
         let filter = self.active_filter();
         let hit = |hay: &str| filter.is_none_or(|q| !search::match_ranges(hay, q).is_empty());
+        let running = self.running_only;
         let mut out = Vec::new();
         for (i, repo) in self.repos.iter().enumerate() {
             let full_name = repo.remote.as_ref().map_or("", |(_, n)| n.as_str());
@@ -768,16 +789,25 @@ impl ActionsView {
                     d.workflows
                         .iter()
                         .filter(|w| repo_hit || hit(&w.workflow.name) || hit(&w.workflow.path))
+                        .filter(|w| {
+                            !running || d.runs_of(w.workflow.id).any(WorkflowRun::is_active)
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
-            if !repo_hit && workflows.is_empty() {
+            if running {
+                // Only repositories with running runs, and those that
+                // failed to load (they may have some).
+                let failed = matches!(repo.data, Load::Failed(_));
+                if workflows.is_empty() && !(failed && repo_hit) {
+                    continue;
+                }
+            } else if !repo_hit && workflows.is_empty() {
                 continue;
             }
             if self.multi {
                 out.push(RowKey::Repo(i));
-                // A filter opens every repository it matches into.
-                if !repo.expanded && filter.is_none() {
+                if !self.repo_open(i) {
                     continue;
                 }
             }
@@ -791,7 +821,13 @@ impl ActionsView {
             for w in workflows {
                 let id = w.workflow.id;
                 out.push(RowKey::Workflow(i, id));
-                if repo.open_workflows.contains(&id) {
+                if running {
+                    out.extend(
+                        data.runs_of(id)
+                            .filter(|r| r.is_active())
+                            .map(|r| RowKey::Run(i, id, r.id)),
+                    );
+                } else if repo.open_workflows.contains(&id) {
                     let before = out.len();
                     out.extend(
                         data.runs_of(id)
@@ -805,6 +841,25 @@ impl ActionsView {
             }
         }
         out
+    }
+
+    /// Switch between all workflows and only running runs; refreshes runs
+    /// right away when switching to running runs.
+    fn toggle_running(&mut self) -> String {
+        self.running_only = !self.running_only;
+        for idx in 0..self.repos.len() {
+            let repo = &mut self.repos[idx];
+            if !self.running_only {
+                repo.schedule_poll(false);
+            } else if !repo.refreshing && repo.ready().is_some() {
+                self.refresh_runs(idx);
+            }
+        }
+        if self.running_only {
+            "showing running runs (a: show all)".to_string()
+        } else {
+            "showing all workflows".to_string()
+        }
     }
 
     pub fn selected_index(&self, rows: &[RowKey]) -> usize {
@@ -866,6 +921,10 @@ impl ActionsView {
     /// Expand (`Some(true)`), collapse (`Some(false)`) or toggle (`None`)
     /// the selected repository or workflow.
     fn set_expanded(&mut self, open: Option<bool>) -> bool {
+        // Everything is open while only running runs are shown.
+        if self.running_only {
+            return false;
+        }
         match self.selected {
             Some(RowKey::Repo(r)) => {
                 let repo = &mut self.repos[r];
@@ -890,6 +949,10 @@ impl ActionsView {
     /// Expand or collapse everything: repositories when there are
     /// several, else the run lists of every workflow.
     fn toggle_all(&mut self) {
+        // Everything is open while only running runs are shown.
+        if self.running_only {
+            return;
+        }
         if self.multi {
             let open = self.repos.iter().any(|r| !r.expanded);
             for repo in &mut self.repos {
@@ -1332,6 +1395,7 @@ impl ActionsView {
                 }
             }
             KeyCode::Char('e') => self.toggle_all(),
+            KeyCode::Char('a') => status = Some(self.toggle_running()),
             KeyCode::Enter => match self.selected {
                 Some(RowKey::Repo(_)) => {
                     self.set_expanded(None);
@@ -1675,6 +1739,7 @@ mod tests {
             selected: None,
             text_filter: None,
             filter_input: None,
+            running_only: false,
             modal: None,
             batch_modal: None,
             marked: HashSet::new(),
@@ -1887,18 +1952,87 @@ mod tests {
         assert_eq!(v.marked.len(), 1);
     }
 
+    fn set_status(v: &mut ActionsView, repo: usize, run: u64, status: &str) {
+        if let Load::Ready(d) = &mut v.repos[repo].data {
+            d.runs.iter_mut().find(|r| r.id == run).unwrap().status = status.into();
+        }
+    }
+
+    #[test]
+    fn running_only_lists_active_runs_of_every_repo() {
+        let mut v = view(
+            true,
+            vec![
+                (
+                    "a",
+                    Load::Ready(data(&[1, 2], &[(10, 1), (11, 1), (12, 2)])),
+                ),
+                ("b", Load::Ready(data(&[3], &[(13, 3)]))),
+                ("c", Load::Failed("boom".into())),
+            ],
+        );
+        set_status(&mut v, 0, 11, "in_progress");
+        set_status(&mut v, 0, 10, "queued");
+        v.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(v.running_only);
+        assert_eq!(
+            v.rows(),
+            vec![
+                RowKey::Repo(0),
+                RowKey::Workflow(0, 1),
+                RowKey::Run(0, 1, 10),
+                RowKey::Run(0, 1, 11),
+                RowKey::Repo(2),
+                RowKey::Note(2),
+            ]
+        );
+        // Folding does nothing; Left goes up a level.
+        v.selected = Some(RowKey::Workflow(0, 1));
+        v.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(v.selected, Some(RowKey::Repo(0)));
+        assert!(v.rows().contains(&RowKey::Run(0, 1, 11)));
+        // A run that finishes drops out.
+        set_status(&mut v, 0, 10, "completed");
+        set_status(&mut v, 0, 11, "completed");
+        assert_eq!(v.rows(), vec![RowKey::Repo(2), RowKey::Note(2)]);
+        v.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(!v.running_only);
+        assert_eq!(
+            v.rows(),
+            vec![RowKey::Repo(0), RowKey::Repo(1), RowKey::Repo(2)]
+        );
+    }
+
+    #[test]
+    fn running_only_ignores_open_workflows() {
+        let mut v = view(
+            false,
+            vec![("r", Load::Ready(data(&[1], &[(10, 1), (11, 1)])))],
+        );
+        v.repos[0].open_workflows.insert(1);
+        set_status(&mut v, 0, 11, "waiting");
+        v.running_only = true;
+        assert_eq!(
+            v.rows(),
+            vec![RowKey::Workflow(0, 1), RowKey::Run(0, 1, 11)]
+        );
+    }
+
     #[test]
     fn poll_backs_off_when_idle() {
         let mut v = view(false, vec![("r", Load::Ready(data(&[1], &[(10, 1)])))]);
-        v.repos[0].schedule_poll();
+        v.repos[0].schedule_poll(false);
         assert!(v.repos[0].next_poll.is_none());
+        v.repos[0].schedule_poll(true);
+        assert!(v.repos[0].next_poll.is_some());
+        v.repos[0].next_poll = None;
         v.repos[0].watch();
         assert!(v.repos[0].next_poll.is_some());
         if let Load::Ready(d) = &mut v.repos[0].data {
             d.runs[0].status = "queued".into();
         }
         v.repos[0].watch_until = None;
-        v.repos[0].schedule_poll();
+        v.repos[0].schedule_poll(false);
         assert!(v.repos[0].next_poll.is_some());
     }
 }

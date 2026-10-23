@@ -69,6 +69,9 @@ fn draw_status(f: &mut Frame, view: &ActionsView, area: Rect) {
     if running > 0 {
         text.push_str(&format!(" | running: {running}"));
     }
+    if view.running_only {
+        text.push_str(" | running only");
+    }
     if let Some(filter) = &view.text_filter {
         text.push_str(&format!(" | filter: {filter}"));
     }
@@ -79,7 +82,12 @@ fn draw_status(f: &mut Frame, view: &ActionsView, area: Rect) {
 }
 
 fn draw_tree(f: &mut Frame, view: &mut ActionsView, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Actions ");
+    let title = if view.running_only {
+        " Actions · running "
+    } else {
+        " Actions "
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -101,8 +109,16 @@ fn draw_tree(f: &mut Frame, view: &mut ActionsView, area: Rect) {
     let selected = view.selected_index(&rows);
     let offset = crate::ui::window_offset(selected, rows.len(), height);
     if rows.is_empty() {
+        let loading = view
+            .repos
+            .iter()
+            .any(|r| r.remote.is_some() && matches!(r.data, Load::Loading));
         let msg = if view.active_filter().is_some() {
             " (nothing matches the filter)"
+        } else if view.running_only && loading {
+            " (loading…)"
+        } else if view.running_only {
+            " (no runs in progress; a: show all)"
         } else {
             " (no repositories)"
         };
@@ -167,7 +183,11 @@ fn row_line(view: &ActionsView, key: RowKey, width: usize) -> Line<'static> {
     let data = repo.ready();
     let left: Vec<Span> = match key {
         RowKey::Repo(_) => {
-            let arrow = if repo.expanded { "▾" } else { "▸" };
+            let arrow = if repo.expanded || view.running_only {
+                "▾"
+            } else {
+                "▸"
+            };
             let mut spans = vec![
                 Span::raw(format!(" {arrow} ")),
                 Span::styled(
@@ -209,9 +229,10 @@ fn row_line(view: &ActionsView, key: RowKey, width: usize) -> Line<'static> {
                     }
                 }
                 // An open repository shows the note on its own row.
-                (_, Some(note)) if !repo.expanded && view.active_filter().is_none() => spans.push(
-                    note_span(matches!(repo.data, Load::Failed(_)), format!("  {note}")),
-                ),
+                (_, Some(note)) if !view.repo_open(key.repo()) => spans.push(note_span(
+                    matches!(repo.data, Load::Failed(_)),
+                    format!("  {note}"),
+                )),
                 _ => {}
             }
             spans
@@ -226,7 +247,7 @@ fn row_line(view: &ActionsView, key: RowKey, width: usize) -> Line<'static> {
         RowKey::Workflow(_, id) => {
             match data.and_then(|d| Some((d, d.workflows.iter().find(|w| w.workflow.id == id)?))) {
                 Some((d, w)) => workflow_spans(
-                    repo.open_workflows.contains(&id),
+                    view.workflow_open(key.repo(), id),
                     indent,
                     d,
                     w,
@@ -391,13 +412,13 @@ fn draw_footer(f: &mut Frame, view: &ActionsView, status: Option<String>, area: 
                 Style::default().fg(Color::Magenta),
             ),
             Span::styled(
-                "s start  R re-run  F re-run failed  X cancel  Space mark/unmark  u unmark all  Esc back",
+                "s start  R re-run  F re-run failed  X cancel  Space mark/unmark  u unmark all  a running  Esc back",
                 DIM,
             ),
         ])
     } else {
         Line::from(Span::styled(
-            " Enter run/open  Space mark  ←→ fold  e fold all  s start  R re-run  F re-run failed  X cancel  o browser  / filter  r refresh  Esc back",
+            " Enter run/open  Space mark  ←→ fold  e fold all  a running  s start  R re-run  F re-run failed  X cancel  o browser  / filter  r refresh  Esc back",
             DIM,
         ))
     };

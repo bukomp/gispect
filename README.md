@@ -301,6 +301,13 @@ dimmed. Expanding a workflow lists its latest 8 runs (from the repository's
 Glyphs: `✓` success, `✗` failure / timed out, `⊘` cancelled / skipped, `●` in
 progress, `◌` queued / waiting, `!` action required, `·` no recent runs.
 
+`a` shows only the runs that are queued or in progress, under their workflows,
+across all repositories. Everything is expanded, and repositories and
+workflows with no active runs are hidden. Repositories that failed to load
+stay visible. Runs refresh every 8 seconds while one is active and every 20
+seconds while none is, so runs started elsewhere also show up. A run leaves
+the list when it finishes. Press `a` again to show all workflows.
+
 | Key | Action |
 |---|---|
 | `j` / `k`, `↓` / `↑` | select |
@@ -311,6 +318,7 @@ progress, `◌` queued / waiting, `!` action required, `·` no recent runs.
 | `l` / `→` | expand |
 | `h` / `←` | collapse, or go to the parent row |
 | `e` | expand / collapse all (repositories, or every workflow's runs in a single repository) |
+| `a` | show only running runs / show all workflows |
 | `Enter` | run the workflow (form), expand a repository, or open a run in the browser |
 | `s` | start the marked workflows (else the form for the selected workflow) |
 | `R` | re-run the selected run (on a workflow row: its latest run); with marks, all marked |
