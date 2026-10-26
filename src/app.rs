@@ -1803,6 +1803,10 @@ impl App {
 
     fn handle_pr_list_key(&mut self, code: KeyCode, modifiers: KeyModifiers, armed: bool) {
         let list = self.list_mut();
+        if list.show_help {
+            list.show_help = false;
+            return;
+        }
         if list.dash_list.is_some() {
             match code {
                 KeyCode::Char('y') => self.copy_dash_list(),
@@ -1945,6 +1949,7 @@ impl App {
                 self.set_status(format!("unmarked {n} PR(s)"));
             }
             KeyCode::Char('y') => self.copy_dash_list(),
+            KeyCode::Char('?') => list.show_help = true,
             KeyCode::Enter => self.open_selected_pr(armed),
             KeyCode::Esc => {
                 if list.text_filter.take().is_some() {
@@ -1983,7 +1988,7 @@ impl App {
 
     fn handle_pr_list_mouse(&mut self, mouse: MouseEvent) {
         let list = self.list_mut();
-        if list.dash_list.is_some() {
+        if list.dash_list.is_some() || list.show_help {
             return;
         }
         if let Some(scroll) = list.info_scroll.as_mut() {

@@ -212,6 +212,8 @@ pub struct PrList {
     pub info_scroll: Option<u16>,
     /// The dash list popup, while it is open.
     pub dash_list: Option<DashList>,
+    /// The key help popup (`?`) is open.
+    pub show_help: bool,
     /// Rows area and scroll offset of the last draw, for mouse mapping.
     pub(crate) view_area: ratatui::layout::Rect,
     pub(crate) view_offset: usize,
@@ -234,6 +236,7 @@ impl PrList {
             marked: Vec::new(),
             info_scroll: None,
             dash_list: None,
+            show_help: false,
             view_area: ratatui::layout::Rect::default(),
             view_offset: 0,
         }

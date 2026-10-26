@@ -402,6 +402,8 @@ pub struct ActionsView {
     pub filter_input: Option<String>,
     /// Show only queued and in-progress runs (and their workflows).
     pub running_only: bool,
+    /// The key help popup (`?`) is open.
+    pub show_help: bool,
     pub modal: Option<RunModal>,
     pub batch_modal: Option<BatchModal>,
     /// Workflow and run rows marked with Space for group actions.
@@ -448,6 +450,7 @@ impl ActionsView {
             text_filter: None,
             filter_input: None,
             running_only: false,
+            show_help: false,
             modal: None,
             batch_modal: None,
             marked: HashSet::new(),
@@ -1309,6 +1312,10 @@ impl ActionsView {
 
     pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> KeyOutcome {
         let armed = self.armed.take();
+        if self.show_help {
+            self.show_help = false;
+            return KeyOutcome::Done(None);
+        }
         if self.batch_modal.is_some() {
             let status = match code {
                 KeyCode::Esc => {
@@ -1396,6 +1403,7 @@ impl ActionsView {
             }
             KeyCode::Char('e') => self.toggle_all(),
             KeyCode::Char('a') => status = Some(self.toggle_running()),
+            KeyCode::Char('?') => self.show_help = true,
             KeyCode::Enter => match self.selected {
                 Some(RowKey::Repo(_)) => {
                     self.set_expanded(None);
@@ -1451,7 +1459,7 @@ impl ActionsView {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.modal.is_some() || self.batch_modal.is_some() {
+        if self.modal.is_some() || self.batch_modal.is_some() || self.show_help {
             return;
         }
         match mouse.kind {
@@ -1740,6 +1748,7 @@ mod tests {
             text_filter: None,
             filter_input: None,
             running_only: false,
+            show_help: false,
             modal: None,
             batch_modal: None,
             marked: HashSet::new(),

@@ -49,7 +49,39 @@ pub fn draw_pr_list(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some(dash) = &list.dash_list {
         draw_dash_list(f, area, dash);
     }
+    if list.show_help {
+        draw_key_help(f, area, LIST_KEYS, None);
+    }
 }
+
+/// Keys listed by the PR list's `?` popup.
+const LIST_KEYS: &[KeyGroup] = &[
+    ("Move", &[("j k ↑ ↓", "select"), ("Tab 1-4", "switch tab")]),
+    (
+        "Open",
+        &[("Enter", "review"), ("i", "info"), ("o", "open in browser")],
+    ),
+    (
+        "Mark",
+        &[
+            ("Space", "mark / unmark"),
+            ("y", "copy dash list"),
+            ("u", "unmark all"),
+        ],
+    ),
+    (
+        "Show",
+        &[
+            ("a", "account"),
+            ("w", "local repos / all"),
+            ("s", "open / closed / merged / all"),
+            ("d", "hide / show drafts"),
+            ("/", "filter"),
+            ("r", "refresh"),
+            ("Esc", "back"),
+        ],
+    ),
+];
 
 /// Preload progress of each list row, in row order.
 fn preload_statuses(list: &PrList, preloader: &Preloader) -> Vec<Option<PreloadStatus>> {
@@ -363,14 +395,11 @@ fn draw_list_footer(f: &mut Frame, list: &PrList, status: Option<String>, area: 
                 format!(" {} marked: ", list.marked.len()),
                 Style::default().fg(Color::Magenta),
             ),
-            Span::styled(
-                "y copy dash list  Space mark/unmark  u unmark all  i info  Enter review  Esc back",
-                DIM,
-            ),
+            Span::styled("y copy dash list  u unmark all  ? keys", DIM),
         ])
     } else {
         Line::from(Span::styled(
-            " Enter review  i info  Space mark  y dash list  Tab/1-4 tab  a account  w repos  s state  d drafts  / filter  o browser  r refresh  Esc back",
+            " Enter review  i info  Space mark  Tab tab  / filter  ? keys  Esc back",
             DIM,
         ))
     };
@@ -769,6 +798,90 @@ pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+/// One group of a key help popup: heading, then (keys, what they do).
+pub(crate) type KeyGroup = (&'static str, &'static [(&'static str, &'static str)]);
+
+/// Width of the key column of a key help popup.
+const KEY_WIDTH: usize = 9;
+
+/// A small popup listing keys by group in two columns, with an optional
+/// dim note under them.
+pub(crate) fn draw_key_help(f: &mut Frame, area: Rect, groups: &[KeyGroup], note: Option<&str>) {
+    // Each group is a heading, its keys and a blank line.
+    let lines_of = |g: &KeyGroup| g.1.len() + 2;
+    let total: usize = groups.iter().map(lines_of).sum();
+    let mut split = groups.len();
+    let mut acc = 0;
+    for (i, g) in groups.iter().enumerate() {
+        if acc * 2 >= total {
+            split = i;
+            break;
+        }
+        acc += lines_of(g);
+    }
+    let column = |groups: &[KeyGroup]| -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        for (i, (heading, keys)) in groups.iter().enumerate() {
+            if i > 0 {
+                out.push(Line::from(""));
+            }
+            out.push(Line::from(Span::styled(
+                format!(" {heading}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for (key, what) in keys.iter() {
+                out.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {key:<KEY_WIDTH$} "),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::raw(*what),
+                ]));
+            }
+        }
+        out
+    };
+    let left = column(&groups[..split]);
+    let right = column(&groups[split..]);
+    let width_of = |lines: &[Line]| lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let (left_w, right_w) = (width_of(&left) + 3, width_of(&right) + 1);
+    let note_rows = if note.is_some() { 2 } else { 0 };
+    let body_h = left.len().max(right.len()) as u16;
+    // Body, note, hint line and the border.
+    let popup = centered(area, left_w + right_w + 2, body_h + note_rows + 3);
+    f.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).title(" keys ");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let [body, hint] = split_last_line(inner);
+    let [cols, note_area] = {
+        let h = body.height.saturating_sub(note_rows);
+        [
+            Rect { height: h, ..body },
+            Rect {
+                y: body.y + h,
+                height: body.height - h,
+                ..body
+            },
+        ]
+    };
+    let [left_area, right_area] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(left_w), Constraint::Min(0)])
+        .areas(cols);
+    f.render_widget(Paragraph::new(left), left_area);
+    f.render_widget(Paragraph::new(right), right_area);
+    if let Some(note) = note {
+        f.render_widget(
+            Paragraph::new(vec![Line::from(""), Line::from(format!(" {note}"))]).style(DIM),
+            note_area,
+        );
+    }
+    f.render_widget(Paragraph::new(" any key closes").style(DIM), hint);
+}
+
 /// Split off the bottom row of `area` (for a hint line).
 pub(crate) fn split_last_line(area: Rect) -> [Rect; 2] {
     let body_height = area.height.saturating_sub(1);
@@ -788,6 +901,34 @@ pub(crate) fn split_last_line(area: Rect) -> [Rect; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_help_lists_every_key_in_two_columns() {
+        use ratatui::backend::TestBackend;
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| draw_key_help(f, f.area(), LIST_KEYS, Some("a note")))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let screen = rows.join("\n");
+        for (heading, keys) in LIST_KEYS {
+            assert!(screen.contains(heading), "{heading}");
+            for (_, what) in keys.iter() {
+                assert!(screen.contains(what), "{what}");
+            }
+        }
+        assert!(screen.contains("a note"));
+        // Two columns: the first and last group share a row range.
+        let row_of = |s: &str| rows.iter().position(|r| r.contains(s)).unwrap();
+        assert!(row_of("Show") < row_of("Mark"));
+    }
 
     #[test]
     fn wrap_splits_newlines_and_long_lines() {

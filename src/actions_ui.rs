@@ -11,11 +11,46 @@ use crate::actions::{ActionsView, BatchModal, Dispatch, RepoData, RowKey, RunMod
 use crate::app::App;
 use crate::gh::WorkflowRun;
 use crate::pr::{self, Load};
-use crate::pr_ui::{centered, mark_gutter, split_last_line, truncate, DIM};
+use crate::pr_ui::{
+    centered, draw_key_help, mark_gutter, split_last_line, truncate, KeyGroup, DIM,
+};
 use crate::workflow::InputKind;
 
 /// Widest workflow name column.
 const MAX_NAME: usize = 40;
+
+/// Keys listed by the `?` popup.
+const KEYS: &[KeyGroup] = &[
+    (
+        "Move",
+        &[
+            ("j k ↑ ↓", "select"),
+            ("h l ← →", "fold / unfold"),
+            ("e", "fold all"),
+        ],
+    ),
+    (
+        "Run",
+        &[
+            ("Enter", "run workflow / open run"),
+            ("s", "start"),
+            ("R", "re-run"),
+            ("F", "re-run failed jobs"),
+            ("X", "cancel (press twice)"),
+        ],
+    ),
+    ("Mark", &[("Space", "mark / unmark"), ("u", "unmark all")]),
+    (
+        "View",
+        &[
+            ("a", "running only / all"),
+            ("/", "filter"),
+            ("o", "open in browser"),
+            ("r", "refresh"),
+            ("Esc", "back"),
+        ],
+    ),
+];
 
 /// The full-screen actions view: status line, tree, footer, modal.
 pub fn draw_actions(f: &mut Frame, app: &mut App, area: Rect) {
@@ -39,6 +74,14 @@ pub fn draw_actions(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if let Some(modal) = &view.batch_modal {
         draw_batch_modal(f, modal, area);
+    }
+    if view.show_help {
+        draw_key_help(
+            f,
+            area,
+            KEYS,
+            Some("With marks, s R F X act on all marked."),
+        );
     }
 }
 
@@ -411,14 +454,11 @@ fn draw_footer(f: &mut Frame, view: &ActionsView, status: Option<String>, area: 
                 format!(" {} marked: ", view.marked.len()),
                 Style::default().fg(Color::Magenta),
             ),
-            Span::styled(
-                "s start  R re-run  F re-run failed  X cancel  Space mark/unmark  u unmark all  a running  Esc back",
-                DIM,
-            ),
+            Span::styled("s start  R re-run  X cancel  u unmark all  ? keys", DIM),
         ])
     } else {
         Line::from(Span::styled(
-            " Enter run/open  Space mark  ←→ fold  e fold all  a running  s start  R re-run  F re-run failed  X cancel  o browser  / filter  r refresh  Esc back",
+            " Enter run/open  Space mark  a running only  / filter  ? keys  Esc back",
             DIM,
         ))
     };

@@ -200,6 +200,7 @@ requests per file).
 | `u` | unmark all |
 | `y` | dash list of the marked PRs (else of the selected PR), copied to the clipboard |
 | `Enter` | review the selected PR |
+| `?` | short key list (any key closes) |
 | `Esc` | back (clears the filter first) |
 | `q` | quit |
 
@@ -327,6 +328,7 @@ the list when it finishes. Press `a` again to show all workflows.
 | `o` | open the workflow or run in the browser |
 | `/` | filter repositories and workflows by name or path (smart-case, live; `Enter` keeps, `Esc` clears) |
 | `r` | refresh everything |
+| `?` | short key list (any key closes) |
 | `Esc` | back (clears the filter first) |
 | `q` | quit |
 
