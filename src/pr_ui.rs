@@ -121,6 +121,9 @@ fn draw_list_status(f: &mut Frame, list: &PrList, statuses: &[Option<PreloadStat
     if !list.marked.is_empty() {
         text.push_str(&format!(" | marked: {}", list.marked.len()));
     }
+    if list.refreshing() {
+        text.push_str(" | refreshing…");
+    }
     let ready = statuses
         .iter()
         .filter(|s| **s == Some(PreloadStatus::Ready))

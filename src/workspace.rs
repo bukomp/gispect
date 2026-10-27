@@ -53,20 +53,23 @@ impl Workspace {
                 root,
             ));
         }
-        let mut members: Vec<Member> = std::fs::read_dir(path)
+        let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(path)
             .into_iter()
             .flatten()
             .flatten()
             .filter(|entry| entry.path().join(".git").exists())
-            .filter_map(|entry| {
-                let repo = GitRepo::discover(&entry.path()).ok()?;
-                Some(Member {
-                    name: entry.file_name().to_string_lossy().into_owned(),
-                    branch: repo.current_branch(),
-                    repo,
-                })
-            })
             .collect();
+        let mut members: Vec<Member> = crate::par::map(&entries, |entry| {
+            let repo = GitRepo::discover(&entry.path()).ok()?;
+            Some(Member {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                branch: repo.current_branch(),
+                repo,
+            })
+        })
+        .into_iter()
+        .flatten()
+        .collect();
         if members.is_empty() {
             bail!(
                 "{} is not inside a git repository and has no repositories directly under it",
@@ -117,8 +120,8 @@ impl Workspace {
             return self.members[0].repo.default_base();
         }
         let mut counts: HashMap<String, usize> = HashMap::new();
-        for member in self.members.iter() {
-            *counts.entry(member.repo.default_base()).or_default() += 1;
+        for base in crate::par::map(&self.members, |m| m.repo.default_base()) {
+            *counts.entry(base).or_default() += 1;
         }
         // Ties break by name so the choice is stable across runs.
         counts
@@ -133,10 +136,9 @@ impl Workspace {
         if !self.is_multi() {
             return self.members[0].repo.local_branches();
         }
-        let all: BTreeSet<String> = self
-            .members
-            .iter()
-            .filter_map(|m| m.repo.local_branches().ok())
+        let all: BTreeSet<String> = crate::par::map(&self.members, |m| m.repo.local_branches())
+            .into_iter()
+            .filter_map(Result::ok)
             .flatten()
             .collect();
         Ok(all.into_iter().collect())
@@ -153,8 +155,11 @@ impl Workspace {
         let mut files = Vec::new();
         let mut first_err = None;
         let mut any_ok = false;
-        for member in self.members.iter() {
-            match member.repo.changed_files(&self.member_mode(member, mode)) {
+        let results = crate::par::map(&self.members, |m| {
+            m.repo.changed_files(&self.member_mode(m, mode))
+        });
+        for (member, result) in self.members.iter().zip(results) {
+            match result {
                 Ok(entries) => {
                     any_ok = true;
                     files.extend(entries.into_iter().map(|e| prefix_entry(&member.name, e)));
@@ -261,11 +266,11 @@ impl Workspace {
     pub fn scope_repos(&self) -> Vec<GitRepo> {
         let mut repos: Vec<GitRepo> = self.members.iter().map(|m| m.repo.clone()).collect();
         let mut seen: HashSet<PathBuf> = repos.iter().map(|r| r.root().to_path_buf()).collect();
-        for dir in repo_dirs_below(&self.root, NESTED_DEPTH) {
-            if let Ok(repo) = GitRepo::discover(&dir) {
-                if seen.insert(repo.root().to_path_buf()) {
-                    repos.push(repo);
-                }
+        let dirs = repo_dirs_below(&self.root, NESTED_DEPTH);
+        let nested = crate::par::map(&dirs, |dir| GitRepo::discover(dir).ok());
+        for repo in nested.into_iter().flatten() {
+            if seen.insert(repo.root().to_path_buf()) {
+                repos.push(repo);
             }
         }
         repos

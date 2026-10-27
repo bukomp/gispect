@@ -45,6 +45,13 @@ const JUMP_PADDING: usize = 5;
 /// keeps memory bounded without LRU bookkeeping.
 const HL_CACHE_MAX: usize = 256;
 
+/// How long the event loop waits for input before checking background
+/// jobs again; bounds how late a finished job shows up.
+const INPUT_WAIT: Duration = Duration::from_millis(30);
+
+/// Redraw at least this often even when nothing changed.
+const IDLE_REDRAW: Duration = Duration::from_millis(250);
+
 /// One side of a file handed to the highlight worker thread.
 struct HlJob {
     generation: u64,
@@ -559,9 +566,12 @@ impl App {
     }
 
     /// Drain finished highlights from the worker: cache every result, and
-    /// display those still matching the current file.
-    pub(crate) fn apply_highlight_results(&mut self) {
+    /// display those still matching the current file. Returns whether any
+    /// arrived.
+    pub(crate) fn apply_highlight_results(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(update) = self.hl_results.try_recv() {
+            changed = true;
             if self.hl_cache.len() >= HL_CACHE_MAX {
                 self.hl_cache.clear();
             }
@@ -574,17 +584,24 @@ impl App {
                 }
             }
         }
+        changed
     }
 
     /// If the watcher flagged a repository change, reload while keeping
-    /// the selected file (matched by path) and scroll position.
-    pub(crate) fn poll_auto_refresh(&mut self) {
-        // A PR review doesn't follow the local repo; leaving it reloads.
-        if self.pr.is_some() || !self.repo_changed.swap(false, Ordering::Relaxed) {
-            return;
+    /// the selected file (matched by path) and scroll position. Returns
+    /// whether it reloaded.
+    pub(crate) fn poll_auto_refresh(&mut self) -> bool {
+        // A PR review doesn't follow the local repo, and the PR list and
+        // Actions screens don't show it: the flag stays raised, so the
+        // diff reloads once it is back on screen.
+        if self.pr.is_some() || self.pr_list_open || self.actions_open {
+            return false;
+        }
+        if !self.repo_changed.swap(false, Ordering::Relaxed) {
+            return false;
         }
         let Some(ws) = &self.workspace else {
-            return;
+            return false;
         };
         let selected_path = self.files.get(self.selected).map(|e| e.path.clone());
         let scroll = self.scroll;
@@ -594,7 +611,7 @@ impl App {
         match ws.changed_files(&self.mode) {
             Ok(files) => self.files = files,
             // Transient failure (e.g. mid-rebase): keep the current view.
-            Err(_) => return,
+            Err(_) => return false,
         }
         self.changed_lines = None;
         if self.active_content_filter().is_some() {
@@ -614,6 +631,7 @@ impl App {
         self.h_scroll_new = h_scroll_new;
         self.h_scroll_files = h_scroll_files;
         self.clamp_scroll();
+        true
     }
 
     /// Number of scrollable rows in the diff view: aligned rows normally,
@@ -1395,17 +1413,18 @@ impl App {
     }
 
     /// Apply finished actions jobs and start due run refreshes.
-    pub(crate) fn poll_actions(&mut self) {
+    pub(crate) fn poll_actions(&mut self) -> bool {
         let Some(view) = self.actions.as_mut() else {
-            return;
+            return false;
         };
-        let messages = view.poll();
+        let (changed, messages) = view.poll();
         if self.actions_open {
             view.tick();
         }
         if let Some(last) = messages.into_iter().last() {
             self.set_status(last);
         }
+        changed
     }
 }
 
@@ -1431,11 +1450,23 @@ impl App {
             return;
         };
         for key in list.missing_queries() {
-            if let Some(account) = list.account_list().get(key.0).cloned() {
-                list.results.insert(key, Load::Loading);
-                let repos = list.scope_for(&account);
-                pr::spawn_search(self.pr_tx.clone(), key, account, repos);
+            let Some(account) = list.account_list().get(key.0).cloned() else {
+                continue;
+            };
+            if !list.results.contains_key(&key) {
+                // Show what this search found last time until it's done.
+                let cached = list
+                    .cache_entry(key)
+                    .and_then(|entry| list.disk.get(&entry).map(<[_]>::to_vec));
+                if cached.is_some() {
+                    list.stale.insert(key);
+                }
+                list.results
+                    .insert(key, cached.map_or(Load::Loading, Load::Ready));
             }
+            list.in_flight.insert(key);
+            let repos = list.scope_for(&account);
+            pr::spawn_search(self.pr_tx.clone(), key, account, repos);
         }
         list.clamp_selection();
         self.sync_preload();
@@ -1471,27 +1502,59 @@ impl App {
     }
 
     /// Drain finished background `gh` jobs into the list and session.
-    pub(crate) fn poll_pr_events(&mut self) {
+    /// Returns whether any finished.
+    pub(crate) fn poll_pr_events(&mut self) -> bool {
+        let mut changed = false;
+        let mut save_cache = false;
+        let mut refresh_error = None;
         while let Ok(event) = self.pr_rx.try_recv() {
+            changed = true;
             match event {
-                PrEvent::Accounts { result, scope } => {
+                PrEvent::Accounts {
+                    result,
+                    scope,
+                    cache,
+                } => {
                     let list = self.list_mut();
+                    let mut cache = cache;
+                    if let Ok(accounts) = &result {
+                        let logins: Vec<(String, String)> = accounts
+                            .iter()
+                            .map(|a| (a.host.clone(), a.login.clone()))
+                            .collect();
+                        cache.retain_accounts(&logins);
+                    }
                     list.accounts = match result {
                         Ok(accounts) => Load::Ready(accounts),
                         Err(e) => Load::Failed(e),
                     };
                     list.scope = scope;
+                    list.disk = cache;
                     self.start_list_queries();
                 }
                 PrEvent::List { key, result } => {
                     let list = self.list_mut();
-                    list.results.insert(
-                        key,
-                        match result {
-                            Ok(prs) => Load::Ready(prs),
-                            Err(e) => Load::Failed(e),
-                        },
-                    );
+                    list.in_flight.remove(&key);
+                    match result {
+                        Ok(prs) => {
+                            if let Some(mut entry) = list.cache_entry(key) {
+                                entry.prs = prs.clone();
+                                list.disk.put(entry);
+                                save_cache = true;
+                            }
+                            list.stale.remove(&key);
+                            list.results.insert(key, Load::Ready(prs));
+                        }
+                        // Keep earlier results (still stale, so retried)
+                        // rather than replacing them with the error.
+                        Err(e) if matches!(list.results.get(&key), Some(Load::Ready(_))) => {
+                            refresh_error = Some(e);
+                        }
+                        Err(e) => {
+                            list.stale.remove(&key);
+                            list.results.insert(key, Load::Failed(e));
+                        }
+                    }
                     list.clamp_selection();
                     self.sync_preload();
                 }
@@ -1647,6 +1710,15 @@ impl App {
                 }
             }
         }
+        if save_cache {
+            if let Some(list) = &self.pr_list {
+                list.disk.save_in_background();
+            }
+        }
+        if let Some(e) = refresh_error {
+            self.set_status(format!("PR refresh failed, showing earlier results: {e}"));
+        }
+        changed
     }
 
     /// With unsent draft comments, the first call arms a confirmation and
@@ -2397,11 +2469,16 @@ pub fn run(
     start: StartView,
 ) -> Result<()> {
     let mut app = App::new(workspace, mode, config);
-    app.reload();
     if start == StartView::Prs || app.workspace.is_none() {
         app.open_pr_list();
     } else if start == StartView::Actions {
         app.open_actions();
+    }
+    if app.pr_list_open || app.actions_open {
+        // Load the diff once it is first shown, not before the first frame.
+        app.repo_changed.store(true, Ordering::Relaxed);
+    } else {
+        app.reload();
     }
 
     spawn_update_check(app.update_state.clone());
@@ -2500,26 +2577,46 @@ fn spawn_update_check(slot: Arc<Mutex<UpdateState>>) {
 }
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+    let mut dirty = true;
+    let mut last_draw = Instant::now();
     loop {
-        terminal.draw(|f| {
-            app.last_viewport_height = f.area().height as usize;
-            crate::ui::draw(f, app);
-        })?;
+        // Redraw only on change, plus a slow idle tick for clocks and
+        // footer notifications that expire.
+        if dirty || last_draw.elapsed() >= IDLE_REDRAW {
+            terminal.draw(|f| {
+                app.last_viewport_height = f.area().height as usize;
+                crate::ui::draw(f, app);
+            })?;
+            last_draw = Instant::now();
+            dirty = false;
+        }
 
         app.expire_status();
-        app.apply_highlight_results();
-        app.poll_auto_refresh();
-        app.poll_pr_events();
-        app.poll_actions();
+        // Non-short-circuiting `|`: every source must be drained.
+        dirty |= app.apply_highlight_results()
+            | app.poll_auto_refresh()
+            | app.poll_pr_events()
+            | app.poll_actions();
 
-        if event::poll(Duration::from_millis(200))? {
+        // Handle every queued input before the next draw, so a burst of
+        // keys or mouse motion never waits a frame per event.
+        let mut timeout = INPUT_WAIT;
+        while event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key.code, key.modifiers);
                 }
                 Event::Mouse(mouse) => app.handle_mouse(mouse),
-                _ => {}
+                Event::Resize(..) => {}
+                _ => continue,
             }
+            dirty = true;
+            timeout = Duration::ZERO;
+            if app.quit || app.trigger_update {
+                break;
+            }
+        }
+        if dirty {
             app.persist_settings();
         }
 

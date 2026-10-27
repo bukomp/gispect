@@ -82,22 +82,22 @@ impl GitRepo {
             .unwrap_or_else(|| "HEAD".to_string())
     }
 
-    /// URLs of the repository's remotes, `origin` first.
+    /// URLs of the repository's remotes, `origin` first. One `git remote
+    /// -v` call: the fetch URL of each, with `insteadOf` rewrites applied.
     pub fn remote_urls(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .git_opt(&["remote"])
-            .unwrap_or_default()
+        let listing = self.git_opt(&["remote", "-v"]).unwrap_or_default();
+        let mut remotes: Vec<(&str, &str)> = listing
             .lines()
-            .map(str::trim)
-            .filter(|n| !n.is_empty() && !n.starts_with('-'))
-            .map(str::to_string)
+            .filter_map(|l| {
+                let (name, rest) = l.split_once('\t')?;
+                Some((name, rest.strip_suffix(" (fetch)")?.trim()))
+            })
+            .filter(|(_, url)| !url.is_empty())
             .collect();
-        names.sort_by_key(|n| n != "origin");
-        names
-            .iter()
-            .filter_map(|n| self.git_opt(&["remote", "get-url", "--", n]))
-            .map(|u| u.trim().to_string())
-            .filter(|u| !u.is_empty())
+        remotes.sort_by_key(|(name, _)| *name != "origin");
+        remotes
+            .into_iter()
+            .map(|(_, url)| url.to_string())
             .collect()
     }
 

@@ -7,18 +7,21 @@
 //! them through one event channel. Rendering lives in `pr_ui.rs`, key handling in
 //! `app.rs`.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::gh::{self, Account, DraftComment, PrDetails, PrSummary, ReviewEvent, Side};
 use crate::git::GitRepo;
+use crate::pr_cache;
 use crate::search;
 use crate::types::{FileEntry, FileStatus};
 use crate::workspace::Workspace;
 
 /// Which search a list tab runs, relative to each account (`@me`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PrTab {
     ReviewRequested,
     Authored,
@@ -68,7 +71,7 @@ impl PrTab {
 }
 
 /// PR state filter, applied server-side in the search query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StateFilter {
     Open,
     Closed,
@@ -153,6 +156,7 @@ pub enum PrEvent {
         result: Result<Vec<Account>, String>,
         /// See [`PrList::scope`].
         scope: Option<Vec<(String, String)>>,
+        cache: pr_cache::Cache,
     },
     List {
         key: QueryKey,
@@ -204,6 +208,13 @@ pub struct PrList {
     /// Filter prompt being typed, if any; filters live while typing.
     pub filter_input: Option<String>,
     pub results: HashMap<QueryKey, Load<Vec<PrSummary>>>,
+    /// Results shown from the disk cache or an earlier search that need
+    /// a fresh search.
+    pub stale: HashSet<QueryKey>,
+    /// Searches running now.
+    pub in_flight: HashSet<QueryKey>,
+    /// Earlier searches from disk, shown until fresh ones finish.
+    pub disk: pr_cache::Cache,
     pub selected: usize,
     /// PRs marked with Space, in marking order; one entry per URL even
     /// when several accounts list the PR.
@@ -232,6 +243,9 @@ impl PrList {
             text_filter: None,
             filter_input: None,
             results: HashMap::new(),
+            stale: HashSet::new(),
+            in_flight: HashSet::new(),
+            disk: pr_cache::Cache::default(),
             selected: 0,
             marked: Vec::new(),
             info_scroll: None,
@@ -270,13 +284,8 @@ impl PrList {
     /// Repositories (`owner/name`) on `account`'s host that its search is
     /// limited to; `None` when unscoped.
     pub fn scope_for(&self, account: &Account) -> Option<Vec<String>> {
-        self.active_scope().map(|scope| {
-            scope
-                .iter()
-                .filter(|(host, _)| *host == account.host)
-                .map(|(_, repo)| repo.clone())
-                .collect()
-        })
+        self.active_scope()
+            .map(|scope| scope_on(scope, &account.host))
     }
 
     /// The text filter in effect: live prompt text, else the committed one.
@@ -287,13 +296,48 @@ impl PrList {
             .filter(|q| !q.is_empty())
     }
 
-    /// Searches the current view needs that haven't been started yet.
+    /// Searches the current view needs that aren't running: missing or
+    /// stale results of the current tab first, then of the other tabs so
+    /// switching to them is instant.
     pub fn missing_queries(&self) -> Vec<QueryKey> {
-        self.shown_accounts()
-            .into_iter()
-            .map(|a| self.key(a, self.tab))
-            .filter(|k| !self.results.contains_key(k))
-            .collect()
+        let tabs =
+            std::iter::once(self.tab).chain(PrTab::ALL.into_iter().filter(|&t| t != self.tab));
+        tabs.flat_map(|tab| {
+            self.shown_accounts()
+                .into_iter()
+                .map(move |a| self.key(a, tab))
+        })
+        .filter(|k| !self.in_flight.contains(k))
+        .filter(|k| !self.results.contains_key(k) || self.stale.contains(k))
+        .collect()
+    }
+
+    /// The disk cache entry for `key`'s search, without PRs.
+    pub fn cache_entry(&self, key: QueryKey) -> Option<pr_cache::Entry> {
+        let account = self.account_list().get(key.0)?;
+        Some(pr_cache::Entry {
+            host: account.host.clone(),
+            login: account.login.clone(),
+            tab: key.1,
+            state: key.2,
+            // From the key, not the live toggle: `w` may have flipped since.
+            repos: self
+                .scope
+                .as_deref()
+                .filter(|_| key.3)
+                .map(|scope| scope_on(scope, &account.host)),
+            saved: pr_cache::now(),
+            prs: Vec::new(),
+        })
+    }
+
+    /// Whether the current view shows earlier results while a fresh
+    /// search runs.
+    pub fn refreshing(&self) -> bool {
+        self.shown_accounts().into_iter().any(|a| {
+            let key = self.key(a, self.tab);
+            self.in_flight.contains(&key) && matches!(self.results.get(&key), Some(Load::Ready(_)))
+        })
     }
 
     /// Rows for `tab` under the current account/state/draft/text filters,
@@ -395,13 +439,24 @@ impl PrList {
         )
     }
 
-    /// Forget cached searches (for one account, or all) so they re-run.
+    /// Mark searches (of one account, or all) stale so they re-run; their
+    /// results stay shown until then.
     pub fn invalidate(&mut self, account: Option<usize>) {
-        match account {
-            Some(a) => self.results.retain(|k, _| k.0 != a),
-            None => self.results.clear(),
-        }
+        let keys = self
+            .results
+            .keys()
+            .filter(|k| account.is_none_or(|a| k.0 == a));
+        self.stale.extend(keys);
     }
+}
+
+/// Repositories of `scope` on `host`.
+fn scope_on(scope: &[(String, String)], host: &str) -> Vec<String> {
+    scope
+        .iter()
+        .filter(|(h, _)| h == host)
+        .map(|(_, repo)| repo.clone())
+        .collect()
 }
 
 /// The dash list popup: its text and what copying it did.
@@ -603,16 +658,25 @@ impl ReviewModal {
 /// the GitHub repositories of `workspace` the list is scoped to.
 pub fn spawn_accounts(tx: mpsc::Sender<PrEvent>, workspace: Option<Workspace>) {
     std::thread::spawn(move || {
-        let (result, remotes) = std::thread::scope(|s| {
+        let (result, remotes, cache) = std::thread::scope(|s| {
             let remotes = s.spawn(|| workspace.as_ref().map(local_remotes));
+            let cache = s.spawn(pr_cache::Cache::load);
             let result = gh::accounts().map_err(|e| e.to_string());
-            (result, remotes.join().ok().flatten())
+            (
+                result,
+                remotes.join().ok().flatten(),
+                cache.join().unwrap_or_default(),
+            )
         });
         let scope = match (&result, remotes) {
             (Ok(accounts), Some(remotes)) => resolve_scope(accounts, remotes),
             _ => None,
         };
-        let _ = tx.send(PrEvent::Accounts { result, scope });
+        let _ = tx.send(PrEvent::Accounts {
+            result,
+            scope,
+            cache,
+        });
     });
 }
 
@@ -620,10 +684,9 @@ pub fn spawn_accounts(tx: mpsc::Sender<PrEvent>, workspace: Option<Workspace>) {
 /// repositories and those nested below it. All remotes count, so PRs to
 /// a fork's upstream show too.
 fn local_remotes(workspace: &Workspace) -> BTreeSet<(String, String)> {
-    workspace
-        .scope_repos()
-        .iter()
-        .flat_map(|repo| repo.remote_urls())
+    crate::par::map(&workspace.scope_repos(), GitRepo::remote_urls)
+        .into_iter()
+        .flatten()
         .filter_map(|url| gh::parse_remote(&url))
         .collect()
 }
@@ -663,21 +726,11 @@ pub fn spawn_search(
             Some(repos) => scoped_queries(&base, repos),
             None => vec![base],
         };
-        let mut prs = Vec::new();
-        let mut error = None;
-        for query in &queries {
-            match gh::search_prs(&account, query) {
-                Ok(found) => prs.extend(found),
-                Err(e) => {
-                    error = Some(e.to_string());
-                    break;
-                }
-            }
-        }
-        let result = match error {
-            Some(e) => Err(e),
-            None => Ok(prs),
-        };
+        let result = crate::par::map(&queries, |q| gh::search_prs(&account, q))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|chunks| chunks.concat())
+            .map_err(|e| e.to_string());
         let _ = tx.send(PrEvent::List { key, result });
     });
 }
@@ -1196,6 +1249,38 @@ mod tests {
             Load::Ready(prs),
         );
         list
+    }
+
+    #[test]
+    fn missing_queries_put_the_current_tab_first_and_rerun_stale_ones() {
+        let mut list = list_with(Vec::new());
+        list.tab = PrTab::Authored;
+        let key = |tab| (0, tab, StateFilter::Open, false);
+        assert_eq!(
+            list.missing_queries(),
+            vec![
+                key(PrTab::Authored),
+                key(PrTab::ReviewRequested),
+                key(PrTab::Assigned),
+                key(PrTab::Involved),
+            ]
+            .into_iter()
+            .filter(|k| k.1 != PrTab::ReviewRequested)
+            .collect::<Vec<_>>()
+        );
+        list.invalidate(None);
+        assert!(list
+            .missing_queries()
+            .contains(&key(PrTab::ReviewRequested)));
+        // Stale results stay shown, and a running search isn't repeated.
+        assert!(matches!(
+            list.results.get(&key(PrTab::ReviewRequested)),
+            Some(Load::Ready(_))
+        ));
+        list.in_flight.insert(key(PrTab::ReviewRequested));
+        assert!(!list
+            .missing_queries()
+            .contains(&key(PrTab::ReviewRequested)));
     }
 
     #[test]

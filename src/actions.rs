@@ -424,12 +424,16 @@ impl ActionsView {
     /// The tree for every repository of `workspace`; starts loading gh
     /// accounts, then each repository's workflows.
     pub fn new(workspace: &Workspace) -> Self {
-        let repos: Vec<RepoNode> = workspace
-            .repos()
+        let members = workspace.repos();
+        let remotes = crate::par::map(&members, |(_, repo, _)| {
+            repo.remote_urls().iter().find_map(|u| gh::parse_remote(u))
+        });
+        let repos: Vec<RepoNode> = members
             .into_iter()
-            .map(|(name, repo, branch)| RepoNode {
+            .zip(remotes)
+            .map(|((name, repo, branch), remote)| RepoNode {
                 name: gh::sanitize_line(&name),
-                remote: repo.remote_urls().iter().find_map(|u| gh::parse_remote(u)),
+                remote,
                 root: repo.root().to_path_buf(),
                 branch: gh::sanitize_line(&branch),
                 data: Load::Loading,
@@ -553,10 +557,13 @@ impl ActionsView {
         }
     }
 
-    /// Apply finished background jobs; returns status messages to show.
-    pub fn poll(&mut self) -> Vec<String> {
+    /// Apply finished background jobs; returns whether any finished and
+    /// the status messages to show.
+    pub fn poll(&mut self) -> (bool, Vec<String>) {
+        let mut changed = false;
         let mut messages = Vec::new();
         while let Ok(event) = self.rx.try_recv() {
+            changed = true;
             match event {
                 ActionsEvent::Accounts(result) => match result {
                     Ok(accounts) => {
@@ -676,7 +683,7 @@ impl ActionsView {
         }
         self.prune_marks();
         self.fix_selection();
-        messages
+        (changed, messages)
     }
 
     /// Count one finished job of group action `id`; the summary message
@@ -1490,17 +1497,22 @@ fn fetch_repo(
     let host = gh::resolve_host(accounts, host)
         .ok_or_else(|| format!("no gh account for {host} (run `gh auth login`)"))?;
     let (account, access) = pick_account(accounts, &host, full_name)?;
-    let workflows = gh::workflows(&account, full_name).map_err(|e| e.to_string())?;
-    let (runs, runs_error) = match gh::workflow_runs(&account, full_name) {
-        Ok(runs) => (runs, None),
-        Err(e) => (Vec::new(), Some(e.to_string())),
+    let (workflows, runs) = std::thread::scope(|s| {
+        let runs = s.spawn(|| gh::workflow_runs(&account, full_name));
+        let workflows = gh::workflows(&account, full_name);
+        (workflows, runs.join())
+    });
+    let workflows = workflows.map_err(|e| e.to_string())?;
+    let (runs, runs_error) = match runs {
+        Ok(Ok(runs)) => (runs, None),
+        Ok(Err(e)) => (Vec::new(), Some(e.to_string())),
+        Err(_) => (Vec::new(), Some("run listing panicked".to_string())),
     };
+    let dispatches = crate::par::map(&workflows, |w| read_dispatch(&account, full_name, root, w));
     let workflows = workflows
         .into_iter()
-        .map(|workflow| WorkflowNode {
-            dispatch: read_dispatch(&account, full_name, root, &workflow),
-            workflow,
-        })
+        .zip(dispatches)
+        .map(|(workflow, dispatch)| WorkflowNode { dispatch, workflow })
         .collect();
     Ok(RepoData {
         account,

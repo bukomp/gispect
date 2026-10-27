@@ -9,7 +9,7 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::types::{FileEntry, FileStatus};
@@ -151,9 +151,15 @@ fn api_error(output: &Output) -> anyhow::Error {
 }
 
 /// Every account `gh` is logged in to, across all hosts, each with its
-/// token. Falls back to just the active account on gh versions without
-/// `gh auth status --json`.
+/// token. Reads gh's `hosts.yml` when it can, since `gh auth status`
+/// checks every token online first; falls back to that, and to just the
+/// active account on gh versions without `gh auth status --json`.
 pub fn accounts() -> Result<Vec<Account>> {
+    if let Some(logins) = configured_logins() {
+        if let Ok(accounts) = with_tokens(logins) {
+            return Ok(accounts);
+        }
+    }
     let output = Command::new("gh")
         .args(["auth", "status", "--json", "hosts"])
         .stdin(Stdio::null())
@@ -168,13 +174,68 @@ pub fn accounts() -> Result<Vec<Account>> {
     if logins.is_empty() {
         bail!("no GitHub accounts — run `gh auth login`");
     }
-    logins
-        .into_iter()
-        .map(|(host, login)| {
-            let token = token_for(&host, Some(&login))?;
-            Ok(Account { host, login, token })
+    with_tokens(logins)
+}
+
+/// `(host, login)` pairs with their tokens, fetched in parallel.
+fn with_tokens(logins: Vec<(String, String)>) -> Result<Vec<Account>> {
+    crate::par::map(&logins, |(host, login)| {
+        let token = token_for(host, Some(login))?;
+        Ok(Account {
+            host: host.clone(),
+            login: login.clone(),
+            token,
         })
-        .collect()
+    })
+    .into_iter()
+    .collect()
+}
+
+/// (host, login) of every account in gh's `hosts.yml`, active account
+/// first per host. `None` when a token variable overrides the stored
+/// accounts, or the file is missing or lists none.
+fn configured_logins() -> Option<Vec<(String, String)>> {
+    let token_env = [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+    ];
+    if token_env.iter().any(|v| std::env::var_os(v).is_some()) {
+        return None;
+    }
+    let dir = match std::env::var_os("GH_CONFIG_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => match std::env::var_os("XDG_CONFIG_HOME") {
+            Some(xdg) => std::path::PathBuf::from(xdg).join("gh"),
+            None => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config/gh"),
+        },
+    };
+    let text = std::fs::read_to_string(dir.join("hosts.yml")).ok()?;
+    parse_hosts_yml(&text).filter(|logins| !logins.is_empty())
+}
+
+/// (host, login) pairs from `hosts.yml`: each host's `users` keys, with
+/// its active `user` first; just `user` in the older single-account
+/// layout.
+fn parse_hosts_yml(text: &str) -> Option<Vec<(String, String)>> {
+    use yaml_rust2::{Yaml, YamlLoader};
+    let docs = YamlLoader::load_from_str(text).ok()?;
+    let hosts = docs.first()?.as_hash()?;
+    let mut out = Vec::new();
+    for (host, entry) in hosts {
+        let Some(host) = host.as_str().filter(|h| valid_host(h)) else {
+            continue;
+        };
+        let active = entry["user"].as_str();
+        let mut users: Vec<&str> = match &entry["users"] {
+            Yaml::Hash(users) => users.keys().filter_map(Yaml::as_str).collect(),
+            _ => active.into_iter().collect(),
+        };
+        users.sort_by_key(|u| Some(*u) != active);
+        out.extend(users.into_iter().map(|u| (host.to_string(), u.to_string())));
+    }
+    Some(out)
 }
 
 /// The active github.com account, for gh versions that can't list
@@ -234,8 +295,10 @@ fn parse_auth_status(json: &str) -> Option<Vec<(String, String)>> {
     Some(out)
 }
 
-/// One pull request as listed by a search.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// One pull request as listed by a search. Serializes flat (`author` and
+/// `repository` as strings), which deserializing also accepts, for the
+/// on-disk list cache.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PrSummary {
     pub number: u64,
@@ -262,8 +325,7 @@ pub struct PrSummary {
 fn login_of<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     let v = Option::<Value>::deserialize(d)?;
     Ok(v.as_ref()
-        .and_then(|v| v.get("login"))
-        .and_then(Value::as_str)
+        .and_then(|v| v.as_str().or_else(|| v.get("login")?.as_str()))
         // Deleted users come back as null authors.
         .unwrap_or("ghost")
         .to_string())
@@ -272,8 +334,7 @@ fn login_of<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> 
 fn name_with_owner<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     let v = Option::<Value>::deserialize(d)?;
     Ok(v.as_ref()
-        .and_then(|v| v.get("nameWithOwner"))
-        .and_then(Value::as_str)
+        .and_then(|v| v.as_str().or_else(|| v.get("nameWithOwner")?.as_str()))
         .unwrap_or_default()
         .to_string())
 }
@@ -312,21 +373,27 @@ fn parse_search(body: &[u8]) -> Option<Vec<PrSummary>> {
             .iter()
             .filter(|n| n.get("number").is_some())
             .filter_map(|n| serde_json::from_value::<PrSummary>(n.clone()).ok())
-            .filter(|pr| valid_repo(&pr.repo))
-            .map(|mut pr| {
-                for field in [
-                    &mut pr.title,
-                    &mut pr.author,
-                    &mut pr.head_ref_name,
-                    &mut pr.base_ref_name,
-                    &mut pr.state,
-                ] {
-                    *field = sanitize_line(field);
-                }
-                pr
-            })
+            .filter_map(clean_summary)
             .collect(),
     )
+}
+
+/// `pr` with its text fields made safe to draw; `None` when its
+/// repository name is malformed.
+pub fn clean_summary(mut pr: PrSummary) -> Option<PrSummary> {
+    if !valid_repo(&pr.repo) {
+        return None;
+    }
+    for field in [
+        &mut pr.title,
+        &mut pr.author,
+        &mut pr.head_ref_name,
+        &mut pr.base_ref_name,
+        &mut pr.state,
+    ] {
+        *field = sanitize_line(field);
+    }
+    Some(pr)
 }
 
 /// Make untrusted text safe to draw. ratatui's paragraph rendering
@@ -1060,6 +1127,20 @@ mod tests {
             ]
         );
         assert!(parse_auth_status("not json").is_none());
+    }
+
+    #[test]
+    fn hosts_yml_lists_users_active_first() {
+        let yml = "github.com:\n    users:\n        alice:\n        bob:\n    git_protocol: ssh\n    user: bob\nghe.example.com:\n    oauth_token: x\n    user: carol\n";
+        assert_eq!(
+            parse_hosts_yml(yml).unwrap(),
+            vec![
+                ("github.com".to_string(), "bob".to_string()),
+                ("github.com".to_string(), "alice".to_string()),
+                ("ghe.example.com".to_string(), "carol".to_string()),
+            ]
+        );
+        assert_eq!(parse_hosts_yml("").map(|v| v.len()), None);
     }
 
     #[test]

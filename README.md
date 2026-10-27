@@ -170,7 +170,11 @@ line shows `repos: owner/name`, `repos: n local` or `repos: all`.
 
 Tabs: Review requested (`review-requested:@me`), Authored, Assigned, Involved.
 Results are the 50 most recently updated per account and tab, cached until
-refreshed. Rows show state (● open/merged/closed, ◌ draft), `repo#number`,
+refreshed. All four tabs load at once, so switching tabs is instant. The last
+results of each search are also saved to `$XDG_CACHE_HOME/gispect/prs.json`
+(falling back to `~/.cache/gispect/prs.json`, readable only by you), so the
+list shows them at startup while fresh searches run; the status line shows
+`refreshing…` until they finish. Rows show state (● open/merged/closed, ◌ draft), `repo#number`,
 title, account (when more than one), author, `+added -removed`, review
 decision and age.
 
