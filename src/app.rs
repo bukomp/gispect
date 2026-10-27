@@ -52,6 +52,9 @@ const INPUT_WAIT: Duration = Duration::from_millis(30);
 /// Redraw at least this often even when nothing changed.
 const IDLE_REDRAW: Duration = Duration::from_millis(250);
 
+/// How often background results are applied while the splash plays.
+const WARMUP_POLL: Duration = Duration::from_millis(10);
+
 /// One side of a file handed to the highlight worker thread.
 struct HlJob {
     generation: u64,
@@ -2475,20 +2478,31 @@ pub fn run(
     let splash = splash::spawn();
 
     let mut app = App::new(workspace, mode, config);
+    spawn_update_check(app.update_state.clone());
     if start == StartView::Prs || app.workspace.is_none() {
         app.open_pr_list();
     } else if start == StartView::Actions {
         app.open_actions();
     }
-    if app.pr_list_open || app.actions_open {
+    if !(app.pr_list_open || app.actions_open) {
+        app.reload();
+    } else if splash.is_finished() {
         // Load the diff once it is first shown, not before the first frame.
         app.repo_changed.store(true, Ordering::Relaxed);
     } else {
+        // The splash is still up, so loading the hidden diff costs no
+        // wait and makes switching to it instant.
         app.reload();
     }
 
-    spawn_update_check(app.update_state.clone());
-
+    // Keep applying background results (highlighting, PR searches,
+    // Actions runs) until the splash ends, so the first frame has them.
+    while !splash.is_finished() {
+        app.apply_highlight_results();
+        app.poll_pr_events();
+        app.poll_actions();
+        std::thread::sleep(WARMUP_POLL);
+    }
     let _ = splash.join();
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;

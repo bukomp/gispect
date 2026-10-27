@@ -1,6 +1,6 @@
 //! Startup splash: a scan beam decodes the half-block wordmark while
 //! red and green ghosts (diff colors) converge on it, then the rows tear
-//! once and the logo settles. Plays for half a second.
+//! once and the logo settles. Plays for 0.7 seconds.
 
 use std::io;
 use std::thread::{self, JoinHandle};
@@ -15,7 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::Terminal;
 
 /// Total splash length.
-pub const DURATION: Duration = Duration::from_millis(500);
+pub const DURATION: Duration = Duration::from_millis(700);
 
 /// Delay between frames.
 const FRAME: Duration = Duration::from_millis(16);
@@ -40,7 +40,7 @@ const LOGO_H: u16 = (LOGO.len() as u16).div_ceil(2);
 const DOT: (i32, i32) = (6, 0);
 
 /// The beam crosses the logo in this many milliseconds.
-const SWEEP_MS: f32 = 300.0;
+const SWEEP_MS: f32 = 420.0;
 /// Columns of decode noise trailing the beam.
 const BAND: f32 = 5.0;
 /// Columns drawn around the logo, so torn rows and ghosts aren't clipped.
@@ -101,8 +101,8 @@ pub fn render(buf: &mut Buffer, area: Rect, ms: f32) {
         ms,
         reveal: beam - BAND,
         split: match ms {
-            ms if ms < 200.0 => 2,
-            ms if ms < 380.0 => 1,
+            ms if ms < 280.0 => 2,
+            ms if ms < 532.0 => 1,
             _ => 0,
         },
     };
@@ -175,10 +175,10 @@ impl Frame {
     /// Horizontal shift of pixel row `y`: two quick scanline tears.
     fn tear(&self, y: i32) -> i32 {
         match (self.ms, y) {
-            (ms, 2 | 3) if (300.0..340.0).contains(&ms) => 3,
-            (ms, 6 | 7) if (300.0..340.0).contains(&ms) => -2,
-            (ms, 4 | 5) if (340.0..380.0).contains(&ms) => -3,
-            (ms, 8) if (340.0..380.0).contains(&ms) => 2,
+            (ms, 2 | 3) if (420.0..476.0).contains(&ms) => 3,
+            (ms, 6 | 7) if (420.0..476.0).contains(&ms) => -2,
+            (ms, 4 | 5) if (476.0..532.0).contains(&ms) => -3,
+            (ms, 8) if (476.0..532.0).contains(&ms) => 2,
             _ => 0,
         }
     }
@@ -241,7 +241,7 @@ mod tests {
     fn last_frame_is_the_clean_wordmark() {
         let area = Rect::new(0, 0, 41, 7);
         let mut buf = Buffer::empty(area);
-        render(&mut buf, area, 500.0);
+        render(&mut buf, area, 700.0);
         assert_eq!(
             text(&buf),
             [
@@ -260,7 +260,7 @@ mod tests {
     fn every_frame_fits_any_size() {
         for (w, h) in [(0, 0), (10, 3), (37, 5), (38, 6), (120, 40)] {
             let area = Rect::new(0, 0, w, h);
-            for ms in (0..=500).step_by(8) {
+            for ms in (0..=700).step_by(8) {
                 let mut buf = Buffer::empty(area);
                 render(&mut buf, area, ms as f32);
             }
