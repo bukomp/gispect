@@ -14,6 +14,7 @@ mod pr_cache;
 mod pr_ui;
 mod search;
 mod search_ui;
+mod splash;
 mod types;
 mod ui;
 mod update;

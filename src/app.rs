@@ -27,7 +27,7 @@ use crate::pr::{self, Load, PrEvent};
 use crate::search;
 use crate::types::{DiffMode, FileEntry, FileStatus, RowKind, SideBySideDiff};
 use crate::workspace::Workspace;
-use crate::{clipboard, diff, update};
+use crate::{clipboard, diff, splash, update};
 
 /// How long a footer notification stays visible before the shortcut
 /// hints come back.
@@ -2468,6 +2468,12 @@ pub fn run(
     config: config::Config,
     start: StartView,
 ) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    let _guard = TerminalGuard;
+    // The splash plays while the app loads behind it.
+    let splash = splash::spawn();
+
     let mut app = App::new(workspace, mode, config);
     if start == StartView::Prs || app.workspace.is_none() {
         app.open_pr_list();
@@ -2483,11 +2489,12 @@ pub fn run(
 
     spawn_update_check(app.update_state.clone());
 
-    enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-    let _guard = TerminalGuard;
+    let _ = splash.join();
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    // The first draw only writes cells that differ from a blank screen,
+    // so wipe the splash first.
+    terminal.clear()?;
 
     let result = event_loop(&mut terminal, &mut app);
 
