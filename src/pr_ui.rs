@@ -59,7 +59,12 @@ const LIST_KEYS: &[KeyGroup] = &[
     ("Move", &[("j k ↑ ↓", "select"), ("Tab 1-4", "switch tab")]),
     (
         "Open",
-        &[("Enter", "review"), ("i", "info"), ("o", "open in browser")],
+        &[
+            ("Enter", "review"),
+            ("i", "info"),
+            ("o", "open in browser (marked)"),
+            ("X X", "close PR (marked)"),
+        ],
     ),
     (
         "Mark",

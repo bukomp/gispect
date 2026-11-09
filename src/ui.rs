@@ -790,6 +790,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
             Line::from("R            submit review (verdict + drafts)"),
             Line::from("i            PR description"),
             Line::from("o            open PR in browser"),
+            Line::from("X X          close PR (press twice)"),
             Line::from("r            re-fetch PR"),
             Line::from("Esc          back to PR list"),
         ]);

@@ -176,6 +176,10 @@ pub enum PrEvent {
         event: ReviewEvent,
         result: Result<(), String>,
     },
+    /// PRs closed with `X`, each with its outcome.
+    Closed {
+        results: Vec<(PrSummary, Result<(), String>)>,
+    },
     PreloadDetails {
         key: PrKey,
         updated_at: String,
@@ -216,9 +220,9 @@ pub struct PrList {
     /// Earlier searches from disk, shown until fresh ones finish.
     pub disk: pr_cache::Cache,
     pub selected: usize,
-    /// PRs marked with Space, in marking order; one entry per URL even
-    /// when several accounts list the PR.
-    pub marked: Vec<PrSummary>,
+    /// PRs marked with Space, in marking order, with the account that
+    /// listed them; one entry per URL even when several accounts list the PR.
+    pub marked: Vec<(Account, PrSummary)>,
     /// Scroll of the selected PR's info popup; `Some` while it is open.
     pub info_scroll: Option<u16>,
     /// The dash list popup, while it is open.
@@ -404,19 +408,19 @@ impl PrList {
     }
 
     pub fn is_marked(&self, pr: &PrSummary) -> bool {
-        self.marked.iter().any(|m| m.url == pr.url)
+        self.marked.iter().any(|(_, m)| m.url == pr.url)
     }
 
     /// Mark or unmark the selected PR; returns whether it is now marked.
     pub fn toggle_mark(&mut self) -> Option<bool> {
-        let (_, pr) = self.selected_row()?;
-        match self.marked.iter().position(|m| m.url == pr.url) {
+        let (account, pr) = self.selected_row()?;
+        match self.marked.iter().position(|(_, m)| m.url == pr.url) {
             Some(i) => {
                 self.marked.remove(i);
                 Some(false)
             }
             None => {
-                self.marked.push(pr);
+                self.marked.push((account, pr));
                 Some(true)
             }
         }
@@ -429,7 +433,7 @@ impl PrList {
             selected = self.selected_row()?.1;
             vec![&selected]
         } else {
-            self.marked.iter().collect()
+            self.marked.iter().map(|(_, pr)| pr).collect()
         };
         Some(
             prs.into_iter()
@@ -437,6 +441,29 @@ impl PrList {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
+    }
+
+    /// PRs that `o` and `X` act on: the marked ones, else the selected one.
+    pub fn pr_targets(&self) -> Vec<(Account, PrSummary)> {
+        if self.marked.is_empty() {
+            self.selected_row().into_iter().collect()
+        } else {
+            self.marked.clone()
+        }
+    }
+
+    /// After PRs were closed: show them closed and drop their marks. A
+    /// fresh search may still list them open until GitHub reindexes them.
+    pub fn mark_closed(&mut self, urls: &[&str]) {
+        for load in self.results.values_mut() {
+            if let Load::Ready(prs) = load {
+                for pr in prs.iter_mut().filter(|pr| urls.contains(&pr.url.as_str())) {
+                    pr.state = "CLOSED".to_string();
+                }
+            }
+        }
+        self.marked
+            .retain(|(_, pr)| !urls.contains(&pr.url.as_str()));
     }
 
     /// Mark searches (of one account, or all) stale so they re-run; their
@@ -746,6 +773,17 @@ pub fn spawn_session(
     std::thread::spawn(move || {
         let result = gh::pr_details(&account, &repo, number).map_err(|e| e.to_string());
         let _ = tx.send(PrEvent::Session { generation, result });
+    });
+}
+
+/// Close `targets` in the background.
+pub fn spawn_close(tx: mpsc::Sender<PrEvent>, targets: Vec<(Account, PrSummary)>) {
+    std::thread::spawn(move || {
+        let results = crate::par::map(&targets, |(account, pr)| {
+            gh::close_pr(account, &pr.repo, pr.number).map_err(|e| e.to_string())
+        });
+        let results = targets.into_iter().map(|(_, pr)| pr).zip(results).collect();
+        let _ = tx.send(PrEvent::Closed { results });
     });
 }
 
@@ -1361,9 +1399,54 @@ mod tests {
             list.dash_list_text().unwrap(),
             "- Add feature — https://github.com/o/r/pull/2\n- Fix bug — https://github.com/o/r/pull/1"
         );
+        let urls = |list: &PrList| {
+            list.pr_targets()
+                .into_iter()
+                .map(|(_, pr)| pr.url)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            urls(&list),
+            [
+                "https://github.com/o/r/pull/2",
+                "https://github.com/o/r/pull/1"
+            ],
+            "marked PRs open in marking order"
+        );
         assert_eq!(list.toggle_mark(), Some(false));
         assert_eq!(list.marked.len(), 1);
         assert!(list.is_marked(list.rows()[0].1));
+        list.marked.clear();
+        list.selected = 0;
+        assert_eq!(
+            urls(&list),
+            ["https://github.com/o/r/pull/2"],
+            "nothing marked: the selected PR"
+        );
+    }
+
+    #[test]
+    fn closing_marks_prs_closed_and_unmarks_them() {
+        let mut one = pr(1, "Fix bug", "2026-01-01T00:00:00Z", false);
+        one.url = "https://github.com/o/r/pull/1".into();
+        let mut two = pr(2, "Add feature", "2026-05-01T00:00:00Z", false);
+        two.url = "https://github.com/o/r/pull/2".into();
+        one.state = "OPEN".into();
+        two.state = "OPEN".into();
+        let mut list = list_with(vec![one, two]);
+        list.accounts = Load::Ready(vec![Account::for_test("me")]);
+        list.toggle_mark();
+        list.selected = 1;
+        list.toggle_mark();
+        list.mark_closed(&["https://github.com/o/r/pull/1"]);
+        let states: Vec<(u64, &str)> = list
+            .rows()
+            .iter()
+            .map(|(_, pr)| (pr.number, pr.state.as_str()))
+            .collect();
+        assert_eq!(states, [(2, "OPEN"), (1, "CLOSED")]);
+        assert_eq!(list.marked.len(), 1);
+        assert_eq!(list.marked[0].1.number, 2);
     }
 
     #[test]

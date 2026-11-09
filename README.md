@@ -198,7 +198,8 @@ requests per file).
 | `d` | hide / show drafts |
 | `/` | text filter over title, repo, author, branch and `#number` (smart-case, live; `Enter` keeps, `Esc` clears) |
 | `r` | refresh |
-| `o` | open in browser |
+| `o` | open the marked PRs (else the selected PR) in the browser |
+| `X` | close the marked PRs (else the selected PR) without merging (press twice to confirm) |
 | `i` | PR info: title, author, branches, state, size, review state, description and changed files |
 | `Space` | mark / unmark the PR and move down |
 | `u` | unmark all |
@@ -217,7 +218,9 @@ PR, `Space` marks, `Enter` opens the review, `o` opens the browser, and `Esc`
 or `i` closes it.
 
 Marked PRs show `▌` at the start of the row, and the status line shows
-`marked: n`. Marks stay when you switch tabs or filters. The dash list has one
+`marked: n`. Marks stay when you switch tabs or filters. `o` opens every
+marked PR in the browser, and `X` closes every open marked PR (the first
+press says what it will close, a second `X` closes; closed PRs are unmarked). The dash list has one
 line per PR, in the order you marked them:
 
 ```
@@ -247,6 +250,7 @@ navigation all work as usual; `m` and `b` are disabled.
 | `R` | submit review |
 | `i` | PR description |
 | `o` | open in browser |
+| `X` | close the PR without merging (press twice to confirm) |
 | `r` | re-fetch the PR (drafts kept) |
 | `Esc` | back to the PR list |
 

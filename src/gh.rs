@@ -709,6 +709,19 @@ pub fn submit_review(
     Ok(())
 }
 
+/// Close PR `number` of `repo` without merging it.
+pub fn close_pr(account: &Account, repo: &str, number: u64) -> Result<()> {
+    ensure_repo(repo)?;
+    account.api(&[
+        "-X",
+        "PATCH",
+        &format!("repos/{repo}/pulls/{number}"),
+        "-f",
+        "state=closed",
+    ])?;
+    Ok(())
+}
+
 /// Open a PR in the browser via `gh pr view --web`.
 pub fn open_in_browser(account: &Account, url: &str) -> Result<()> {
     if !url.starts_with(&format!("https://{}/", account.host)) {

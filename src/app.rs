@@ -23,6 +23,7 @@ use crate::actions;
 use crate::config;
 use crate::gh::{self, Side};
 use crate::highlight::{self, HlLines};
+use crate::par;
 use crate::pr::{self, Load, PrEvent};
 use crate::search;
 use crate::types::{DiffMode, FileEntry, FileStatus, RowKind, SideBySideDiff};
@@ -221,6 +222,8 @@ pub struct App {
     pub(crate) pr_info_scroll: Option<u16>,
     /// Set by a first quit/leave with unsent drafts; a second one confirms.
     discard_armed: bool,
+    /// URLs a first `X` offered to close; a second `X` closes them.
+    close_armed: Option<Vec<String>>,
     /// GitHub Actions view state, kept across visits.
     pub(crate) actions: Option<actions::ActionsView>,
     /// Whether the actions screen is showing.
@@ -322,6 +325,7 @@ impl App {
             review_modal: None,
             pr_info_scroll: None,
             discard_armed: false,
+            close_armed: None,
             actions: None,
             actions_open: false,
         }
@@ -992,6 +996,10 @@ impl App {
         // Any key other than a repeated quit/leave disarms the draft
         // discard confirmation.
         let armed = std::mem::take(&mut self.discard_armed);
+        // Likewise any key but a repeated `X` disarms closing PRs.
+        if code != KeyCode::Char('X') {
+            self.close_armed = None;
+        }
         if self.actions_open {
             self.handle_actions_key(code, modifiers, armed);
             return;
@@ -1711,6 +1719,7 @@ impl App {
                         },
                     }
                 }
+                PrEvent::Closed { results } => self.apply_closed(results),
             }
         }
         if save_cache {
@@ -1858,22 +1867,121 @@ impl App {
         self.set_status("refreshing PR…");
     }
 
-    /// Open the selected list PR, or the one under review, in the browser.
-    fn open_in_browser(&mut self) {
-        let target = if self.pr_list_open {
-            self.pr_list.as_ref().and_then(|l| l.selected_row())
+    /// The PRs `o` and `X` act on: the marked list PRs (else the selected
+    /// one), or the one under review.
+    fn pr_targets(&self) -> Vec<(gh::Account, gh::PrSummary)> {
+        if self.pr_list_open {
+            self.pr_list
+                .as_ref()
+                .map(|l| l.pr_targets())
+                .unwrap_or_default()
         } else {
             self.pr
                 .as_ref()
                 .map(|s| (s.account.clone(), s.summary.clone()))
-        };
-        let Some((account, summary)) = target else {
-            return;
-        };
-        match gh::open_in_browser(&account, &summary.url) {
-            Ok(()) => self.set_status(format!("opened {}#{}", summary.repo, summary.number)),
-            Err(e) => self.set_status(format!("error: {e}")),
+                .into_iter()
+                .collect()
         }
+    }
+
+    /// `X`: close the open PRs among [`Self::pr_targets`]. The first press
+    /// says what it will close; a second `X` right after closes them.
+    fn close_prs(&mut self) {
+        let targets = self.pr_targets();
+        let total = targets.len();
+        let open: Vec<_> = targets
+            .into_iter()
+            .filter(|(_, pr)| pr.state == "OPEN")
+            .collect();
+        if open.is_empty() {
+            self.set_status(match total {
+                0 => "no pull request selected",
+                1 => "this pull request is not open",
+                _ => "none of the marked pull requests are open",
+            });
+            return;
+        }
+        let urls: Vec<String> = open.iter().map(|(_, pr)| pr.url.clone()).collect();
+        if self.close_armed.take().as_ref() != Some(&urls) {
+            let what = match open.as_slice() {
+                [(_, pr)] => format!("{}#{}", pr.repo, pr.number),
+                _ => format!("{} PRs", open.len()),
+            };
+            let skipped = match total - open.len() {
+                0 => String::new(),
+                n => format!(" ({n} not open, skipped)"),
+            };
+            self.close_armed = Some(urls);
+            self.set_status(format!("press X again to close {what}{skipped}"));
+            return;
+        }
+        let n = open.len();
+        pr::spawn_close(self.pr_tx.clone(), open);
+        self.set_status(format!("closing {n} PR(s)…"));
+    }
+
+    fn apply_closed(&mut self, results: Vec<(gh::PrSummary, Result<(), String>)>) {
+        let closed: Vec<&str> = results
+            .iter()
+            .filter(|(_, r)| r.is_ok())
+            .map(|(pr, _)| pr.url.as_str())
+            .collect();
+        if let Some(list) = self.pr_list.as_mut() {
+            list.mark_closed(&closed);
+            list.invalidate(None);
+        }
+        if let Some(session) = self.pr.as_mut() {
+            if closed.contains(&session.summary.url.as_str()) {
+                session.summary.state = "CLOSED".to_string();
+            }
+        }
+        let errors: Vec<String> = results
+            .iter()
+            .filter_map(|(pr, r)| {
+                r.as_ref()
+                    .err()
+                    .map(|e| format!("{}#{}: {e}", pr.repo, pr.number))
+            })
+            .collect();
+        let status = match (results.as_slice(), errors.as_slice()) {
+            ([(pr, _)], []) => format!("closed {}#{}", pr.repo, pr.number),
+            ([_], [e]) => format!("close failed: {e}"),
+            (_, []) => format!("closed {} PRs", results.len()),
+            (_, [first, ..]) => format!(
+                "closed {} of {} PRs; error: {first}",
+                closed.len(),
+                results.len()
+            ),
+        };
+        if self.pr_list_open {
+            self.start_list_queries();
+        }
+        self.set_status(status);
+    }
+
+    /// Open [`Self::pr_targets`] in the browser.
+    fn open_in_browser(&mut self) {
+        let targets = self.pr_targets();
+        let results = par::map(&targets, |(account, summary)| {
+            gh::open_in_browser(account, &summary.url)
+        });
+        let errors: Vec<String> = results
+            .into_iter()
+            .zip(&targets)
+            .filter_map(|(r, (_, pr))| r.err().map(|e| format!("{}#{}: {e}", pr.repo, pr.number)))
+            .collect();
+        let status = match (targets.as_slice(), errors.as_slice()) {
+            ([], _) => return,
+            ([(_, pr)], []) => format!("opened {}#{}", pr.repo, pr.number),
+            ([_], [e]) => format!("error: {e}"),
+            (_, []) => format!("opened {} PRs", targets.len()),
+            (_, [first, ..]) => format!(
+                "opened {} of {} PRs; error: {first}",
+                targets.len() - errors.len(),
+                targets.len()
+            ),
+        };
+        self.set_status(status);
     }
 
     fn handle_pr_list_key(&mut self, code: KeyCode, modifiers: KeyModifiers, armed: bool) {
@@ -1910,6 +2018,7 @@ impl App {
                     list.toggle_mark();
                 }
                 KeyCode::Char('o') => self.open_in_browser(),
+                KeyCode::Char('X') => self.close_prs(),
                 KeyCode::Enter => {
                     list.info_scroll = None;
                     self.open_selected_pr(armed);
@@ -2009,6 +2118,7 @@ impl App {
                 self.set_status("refreshing…");
             }
             KeyCode::Char('o') => self.open_in_browser(),
+            KeyCode::Char('X') => self.close_prs(),
             KeyCode::Char('i') => {
                 if !list.rows().is_empty() {
                     list.info_scroll = Some(0);
@@ -2104,6 +2214,7 @@ impl App {
             KeyCode::Char('R') => self.open_review_modal(),
             KeyCode::Char('i') => self.pr_info_scroll = Some(0),
             KeyCode::Char('o') => self.open_in_browser(),
+            KeyCode::Char('X') => self.close_prs(),
             KeyCode::Char('r') => self.refresh_pr(),
             KeyCode::Char('m') | KeyCode::Char('b') => {
                 self.set_status("not available while reviewing a PR");
