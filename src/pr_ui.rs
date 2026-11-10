@@ -213,7 +213,7 @@ fn draw_rows(f: &mut Frame, list: &mut PrList, statuses: &[Option<PreloadStatus>
     };
 
     let multi_account = list.account_list().len() > 1;
-    let rows = list.rows();
+    let rows = list.tree_rows_for(list.tab);
     let height = rows_area.height as usize;
     let offset = crate::ui::window_offset(list.selected, rows.len(), height);
 
@@ -232,12 +232,13 @@ fn draw_rows(f: &mut Frame, list: &mut PrList, statuses: &[Option<PreloadStatus>
             .enumerate()
             .skip(offset)
             .take(height)
-            .map(|(i, (account, pr))| {
+            .map(|(i, ((account, pr), tree))| {
                 let account = multi_account
                     .then(|| accounts.get(*account).map(|a| a.label()))
                     .flatten();
                 pr_row(
                     pr,
+                    tree,
                     account,
                     statuses.get(i).copied().flatten(),
                     &cols,
@@ -266,11 +267,17 @@ struct Columns {
 }
 
 impl Columns {
-    fn fit(rows: &[(usize, &PrSummary)]) -> Self {
-        let max =
-            |f: &dyn Fn(&PrSummary) -> usize| rows.iter().map(|(_, pr)| f(pr)).max().unwrap_or(0);
+    fn fit(rows: &[pr::TreeRow]) -> Self {
+        let max = |f: &dyn Fn(&PrSummary) -> usize| {
+            rows.iter().map(|((_, pr), _)| f(pr)).max().unwrap_or(0)
+        };
         Columns {
-            repo: max(&|pr| repo_label(pr).len()).min(48),
+            repo: rows
+                .iter()
+                .map(|((_, pr), tree)| tree.chars().count() + repo_label(pr).len())
+                .max()
+                .unwrap_or(0)
+                .min(48),
             author: max(&|pr| pr.author.chars().count()).min(24),
             additions: max(&|pr| pr.additions.to_string().len()),
             deletions: max(&|pr| pr.deletions.to_string().len()),
@@ -282,8 +289,10 @@ fn repo_label(pr: &PrSummary) -> String {
     format!("{}#{}", pr.repo, pr.number)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pr_row(
     pr: &PrSummary,
+    tree: &str,
     account: Option<String>,
     preload: Option<PreloadStatus>,
     cols: &Columns,
@@ -319,11 +328,15 @@ fn pr_row(
             format!("{preload_glyph} "),
             Style::default().fg(preload_color),
         ),
+        Span::styled(tree.to_string(), DIM),
         Span::styled(
             format!(
                 "{:<w$} ",
-                truncate(&repo_label(pr), cols.repo),
-                w = cols.repo
+                truncate(
+                    &repo_label(pr),
+                    cols.repo.saturating_sub(tree.chars().count())
+                ),
+                w = cols.repo.saturating_sub(tree.chars().count())
             ),
             Style::default().fg(Color::Cyan),
         ),

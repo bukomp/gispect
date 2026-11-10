@@ -168,6 +168,11 @@ ignored; when no remote is left (or outside any repository), the list shows
 all PRs. `w` switches between local repositories and all PRs, and the status
 line shows `repos: owner/name`, `repos: n local` or `repos: all`.
 
+Stacked PRs show as a tree, like the `tree` command: a PR whose base branch is
+the head branch of another listed PR in the same repository is indented under
+it with `├─`/`└─`. PRs based on `main` (or on any branch with no listed PR)
+are roots. Each stack takes the place of its most recently updated PR.
+
 Tabs: Review requested (`review-requested:@me`), Authored, Assigned, Involved.
 Results are the 50 most recently updated per account and tab, cached until
 refreshed. All four tabs load at once, so switching tabs is instant. The last

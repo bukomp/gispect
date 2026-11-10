@@ -345,8 +345,22 @@ impl PrList {
     }
 
     /// Rows for `tab` under the current account/state/draft/text filters,
-    /// newest update first. Each row pairs an account index with a PR.
+    /// newest update first, with stacked PRs right under the PR they are
+    /// based on. Each row pairs an account index with a PR.
     pub fn rows_for(&self, tab: PrTab) -> Vec<(usize, &PrSummary)> {
+        stack_rows(self.flat_rows(tab))
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect()
+    }
+
+    /// [`Self::rows_for`] with each row's tree prefix (`├─ `, `│  └─ `…)
+    /// showing which PRs are based on which.
+    pub fn tree_rows_for(&self, tab: PrTab) -> Vec<TreeRow<'_>> {
+        stack_rows(self.flat_rows(tab))
+    }
+
+    fn flat_rows(&self, tab: PrTab) -> Vec<(usize, &PrSummary)> {
         let filter = self.active_text_filter();
         let mut rows: Vec<(usize, &PrSummary)> = self
             .shown_accounts()
@@ -1262,6 +1276,91 @@ fn parse_utc(ts: &str) -> Option<i64> {
     Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
 }
 
+/// A list row with its tree prefix (empty for roots).
+pub type TreeRow<'a> = ((usize, &'a PrSummary), String);
+
+/// Order `rows` (newest first) as a forest: a PR whose base branch is
+/// another listed PR's head branch in the same repo goes under it, like
+/// `tree`. Stacks keep the place of their newest PR; siblings stay
+/// newest first.
+pub fn stack_rows(rows: Vec<(usize, &PrSummary)>) -> Vec<TreeRow<'_>> {
+    let parent: Vec<Option<usize>> = rows
+        .iter()
+        .map(|(_, pr)| {
+            if pr.base_ref_name.is_empty() {
+                return None;
+            }
+            rows.iter().position(|(_, p)| {
+                p.url != pr.url
+                    && !p.is_cross_repository
+                    && p.repo == pr.repo
+                    && p.head_ref_name == pr.base_ref_name
+            })
+        })
+        .collect();
+    let mut forest = Forest {
+        children: vec![Vec::new(); rows.len()],
+        seen: vec![false; rows.len()],
+        out: Vec::with_capacity(rows.len()),
+        rows: &rows,
+    };
+    for (i, p) in parent.iter().enumerate() {
+        if let Some(p) = *p {
+            forest.children[p].push(i);
+        }
+    }
+    for start in 0..rows.len() {
+        if forest.seen[start] {
+            continue;
+        }
+        // Climb to the stack's root; a base-branch cycle has none, so
+        // the walk stops where it would revisit a PR.
+        let mut root = start;
+        let mut path = vec![start];
+        while let Some(p) = parent[root] {
+            if forest.seen[p] || path.contains(&p) {
+                break;
+            }
+            path.push(p);
+            root = p;
+        }
+        forest.walk(root, "", None);
+    }
+    forest.out
+}
+
+struct Forest<'r, 'a> {
+    rows: &'r [(usize, &'a PrSummary)],
+    children: Vec<Vec<usize>>,
+    seen: Vec<bool>,
+    out: Vec<TreeRow<'a>>,
+}
+
+impl Forest<'_, '_> {
+    /// Emit row `i` and its unseen descendants; `last` is whether `i` is
+    /// its parent's last child (`None` for a root).
+    fn walk(&mut self, i: usize, indent: &str, last: Option<bool>) {
+        if self.seen[i] {
+            return;
+        }
+        self.seen[i] = true;
+        let (prefix, child_indent) = match last {
+            None => (String::new(), String::new()),
+            Some(true) => (format!("{indent}└─ "), format!("{indent}   ")),
+            Some(false) => (format!("{indent}├─ "), format!("{indent}│  ")),
+        };
+        self.out.push((self.rows[i], prefix));
+        let kids: Vec<usize> = self.children[i]
+            .iter()
+            .copied()
+            .filter(|&c| !self.seen[c])
+            .collect();
+        for (n, &c) in kids.iter().enumerate() {
+            self.walk(c, &child_indent, Some(n + 1 == kids.len()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,6 +1457,66 @@ mod tests {
         list.scoped = false;
         assert_eq!(list.scope_for(&account), None);
         assert!(!list.key(0, PrTab::Authored).3);
+    }
+
+    fn stacked(number: u64, updated: &str, head: &str, base: &str) -> PrSummary {
+        PrSummary {
+            url: format!("u{number}"),
+            head_ref_name: head.into(),
+            base_ref_name: base.into(),
+            ..pr(number, "t", updated, false)
+        }
+    }
+
+    #[test]
+    fn rows_nest_stacked_prs_under_their_base_like_tree() {
+        let list = list_with(vec![
+            stacked(1, "2026-01-01T00:00:00Z", "a", "main"),
+            stacked(2, "2026-01-04T00:00:00Z", "b", "a"),
+            stacked(3, "2026-01-02T00:00:00Z", "c", "a"),
+            stacked(4, "2026-01-03T00:00:00Z", "d", "b"),
+            stacked(5, "2026-01-05T00:00:00Z", "e", "main"),
+        ]);
+        let tree: Vec<(u64, String)> = list
+            .tree_rows_for(list.tab)
+            .into_iter()
+            .map(|((_, p), prefix)| (p.number, prefix))
+            .collect();
+        let want = [(5, ""), (1, ""), (2, "├─ "), (4, "│  └─ "), (3, "└─ ")];
+        assert_eq!(tree, want.map(|(n, p)| (n, p.to_string())).to_vec());
+        let numbers: Vec<u64> = list.rows().iter().map(|(_, p)| p.number).collect();
+        assert_eq!(numbers, vec![5, 1, 2, 4, 3]);
+    }
+
+    #[test]
+    fn stacks_ignore_forks_other_repos_and_survive_cycles() {
+        let mut fork = stacked(1, "2026-01-03T00:00:00Z", "main", "main");
+        fork.is_cross_repository = true;
+        let mut other = stacked(2, "2026-01-02T00:00:00Z", "x", "main");
+        other.repo = "o/other".into();
+        let list = list_with(vec![
+            fork,
+            other,
+            stacked(3, "2026-01-01T00:00:00Z", "y", "x"),
+            stacked(4, "2026-01-05T00:00:00Z", "p", "q"),
+            stacked(5, "2026-01-04T00:00:00Z", "q", "p"),
+        ]);
+        let tree: Vec<(u64, String)> = list
+            .tree_rows_for(list.tab)
+            .into_iter()
+            .map(|((_, p), prefix)| (p.number, prefix))
+            .collect();
+        assert_eq!(tree.len(), 5);
+        assert!(tree
+            .iter()
+            .filter(|(n, _)| [1, 2, 3].contains(n))
+            .all(|(_, p)| p.is_empty()));
+        let cycle: Vec<&String> = tree
+            .iter()
+            .filter(|(n, _)| *n >= 4)
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(cycle.iter().filter(|p| p.is_empty()).count(), 1);
     }
 
     #[test]

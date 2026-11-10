@@ -316,6 +316,9 @@ pub struct PrSummary {
     pub review_decision: Option<String>,
     pub head_ref_name: String,
     pub base_ref_name: String,
+    /// Head branch lives in a fork, so its name says nothing about
+    /// branches in `repo`.
+    pub is_cross_repository: bool,
     #[serde(deserialize_with = "login_of")]
     pub author: String,
     #[serde(rename = "repository", deserialize_with = "name_with_owner")]
@@ -341,7 +344,7 @@ fn name_with_owner<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::
 
 const SEARCH_QUERY: &str = "query($q: String!) { search(query: $q, type: ISSUE, first: 50) { \
     nodes { ... on PullRequest { number title url isDraft state updatedAt additions deletions \
-    changedFiles reviewDecision headRefName baseRefName author { login } \
+    changedFiles reviewDecision headRefName baseRefName isCrossRepository author { login } \
     repository { nameWithOwner } } } } }";
 
 /// Run a GitHub PR search (`q` uses search syntax, `@me` = this account).
