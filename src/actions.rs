@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
-use crate::gh::{self, Account, RunAction, Workflow, WorkflowRun};
+use crate::gh::{self, Account, Job, RunAction, Workflow, WorkflowRun};
 use crate::pr::Load;
 use crate::search;
 use crate::workflow::{self, DispatchInput, InputKind};
@@ -35,6 +35,116 @@ const WATCH_FOR: Duration = Duration::from_secs(45);
 /// Refresh interval while only running runs are shown and none is, so
 /// runs started elsewhere show up.
 const RUNNING_POLL: Duration = Duration::from_secs(20);
+/// Job refresh interval of the run detail screen while a run is active.
+const JOBS_POLL: Duration = Duration::from_secs(5);
+
+/// The run detail screen: the job graph and steps of one or more runs
+/// (a run, a workflow's latest run, or every run one push started).
+pub struct RunDetail {
+    pub repo: usize,
+    /// Runs shown, top to bottom.
+    pub runs: Vec<u64>,
+    /// Jobs of each run, in the order of `runs`.
+    pub jobs: Vec<Load<Vec<Job>>>,
+    /// Selected job: index into `runs`, job id.
+    pub selected: Option<(usize, u64)>,
+    /// Scroll offsets of the graph, kept by the renderer.
+    pub scroll: (usize, usize),
+    /// Screen area and target of each drawn job box, for mouse clicks.
+    pub(crate) boxes: Vec<(Rect, (usize, u64))>,
+    refreshing: usize,
+    next_poll: Option<Instant>,
+}
+
+impl RunDetail {
+    /// Graph of section `s`, when its jobs are loaded.
+    pub fn graph(&self, s: usize) -> Option<(&[Job], crate::run_graph::Graph)> {
+        match self.jobs.get(s)? {
+            Load::Ready(jobs) => Some((jobs, crate::run_graph::layout(jobs))),
+            _ => None,
+        }
+    }
+
+    pub fn selected_job(&self) -> Option<&Job> {
+        let (s, id) = self.selected?;
+        match self.jobs.get(s)? {
+            Load::Ready(jobs) => jobs.iter().find(|j| j.id == id),
+            _ => None,
+        }
+    }
+
+    /// First job (top of the first column) of section `s`.
+    fn first_job(&self, s: usize) -> Option<u64> {
+        let (jobs, graph) = self.graph(s)?;
+        let first = *graph.columns.first()?.first()?;
+        Some(jobs[first].id)
+    }
+
+    /// Keep the selection on an existing job, else the first job shown.
+    fn fix_selection(&mut self) {
+        if self.selected_job().is_some() {
+            return;
+        }
+        let keep = self.selected.map(|(s, _)| s);
+        let sections = keep.into_iter().chain(0..self.runs.len());
+        self.selected = sections
+            .filter_map(|s| Some((s, self.first_job(s)?)))
+            .next();
+    }
+
+    /// Move the selection by `rows` within its column (on into the next
+    /// or previous run past the ends) or by `cols` columns.
+    fn move_selection(&mut self, rows: isize, cols: isize) {
+        let Some((s, id)) = self.selected else {
+            self.fix_selection();
+            return;
+        };
+        let Some((jobs, graph)) = self.graph(s) else {
+            return;
+        };
+        let Some((c, r)) = jobs
+            .iter()
+            .position(|j| j.id == id)
+            .and_then(|i| graph.position(i))
+        else {
+            return;
+        };
+        if cols != 0 {
+            let c = (c as isize + cols).clamp(0, graph.columns.len() as isize - 1) as usize;
+            let col = &graph.columns[c];
+            let r = r.min(col.len() - 1);
+            self.selected = Some((s, jobs[col[r]].id));
+            return;
+        }
+        let r = r as isize + rows;
+        let col = &graph.columns[c];
+        if (0..col.len() as isize).contains(&r) {
+            self.selected = Some((s, jobs[col[r as usize]].id));
+            return;
+        }
+        // Past the end of the column: the next / previous run that has jobs.
+        let next: Vec<usize> = if r < 0 {
+            (0..s).rev().collect()
+        } else {
+            (s + 1..self.runs.len()).collect()
+        };
+        for t in next {
+            if let Some((jobs, graph)) = self.graph(t) {
+                let Some(col) = graph
+                    .columns
+                    .get(c.min(graph.columns.len().saturating_sub(1)))
+                else {
+                    continue;
+                };
+                let pick = if r < 0 { col.last() } else { col.first() };
+                if let Some(&j) = pick {
+                    self.selected = Some((t, jobs[j].id));
+                    return;
+                }
+            }
+        }
+    }
+}
 
 /// Whether and how a workflow can be started by hand.
 #[derive(Debug, Clone)]
@@ -267,6 +377,11 @@ pub enum ActionsEvent {
         batch: Option<u64>,
         result: Result<(), String>,
     },
+    Jobs {
+        idx: usize,
+        run: u64,
+        result: Result<Vec<Job>, String>,
+    },
 }
 
 /// A group action in flight: its results are summed up in one message.
@@ -443,6 +558,8 @@ pub struct ActionsView {
     pub show_help: bool,
     pub modal: Option<RunModal>,
     pub batch_modal: Option<BatchModal>,
+    /// The run detail screen, over the tree.
+    pub detail: Option<RunDetail>,
     /// Workflow and run rows marked with Space for group actions.
     pub marked: HashSet<RowKey>,
     /// A run action a first key press asked for (cancel, or any group
@@ -494,6 +611,7 @@ impl ActionsView {
             show_help: false,
             modal: None,
             batch_modal: None,
+            detail: None,
             marked: HashSet::new(),
             armed: None,
             batches: Vec::new(),
@@ -585,6 +703,11 @@ impl ActionsView {
     /// Start run refreshes that are due. Call regularly while the screen
     /// is open.
     pub fn tick(&mut self) {
+        if let Some(d) = &self.detail {
+            if d.refreshing == 0 && d.next_poll.is_some_and(|t| t <= Instant::now()) {
+                self.load_jobs();
+            }
+        }
         let now = Instant::now();
         for idx in 0..self.repos.len() {
             let repo = &self.repos[idx];
@@ -716,6 +839,26 @@ impl ActionsView {
                         messages.push(format!("{} of #{run_number} failed: {e}", action.label()))
                     }
                 },
+                ActionsEvent::Jobs { idx, run, result } => {
+                    let Some(detail) = self.detail.as_mut().filter(|d| d.repo == idx) else {
+                        continue;
+                    };
+                    let Some(s) = detail.runs.iter().position(|&r| r == run) else {
+                        continue;
+                    };
+                    detail.refreshing = detail.refreshing.saturating_sub(1);
+                    detail.jobs[s] = match result {
+                        Ok(jobs) => Load::Ready(jobs),
+                        // Keep what was shown when a refresh fails.
+                        Err(_) if matches!(detail.jobs[s], Load::Ready(_)) => {
+                            self.schedule_jobs_poll();
+                            continue;
+                        }
+                        Err(e) => Load::Failed(e),
+                    };
+                    detail.fix_selection();
+                    self.schedule_jobs_poll();
+                }
             }
         }
         self.prune_marks();
@@ -986,9 +1129,156 @@ impl ActionsView {
         self.repos.get(idx).and_then(RepoNode::ready)
     }
 
+    fn run_active(&self, idx: usize, run: u64) -> bool {
+        self.repo_data(idx)
+            .and_then(|d| d.runs.iter().find(|r| r.id == run))
+            .is_some_and(WorkflowRun::is_active)
+    }
+
+    /// Open the run detail screen for the selected run, commit (all the
+    /// runs it started) or workflow (its latest run).
+    fn open_detail(&mut self) -> Option<String> {
+        let key = self.selected?;
+        let data = self.repo_data(key.repo())?;
+        let runs: Vec<u64> = match key {
+            RowKey::Run(_, _, id) => vec![id],
+            RowKey::Trigger(_, t) => data.trigger_runs(t).iter().map(|r| r.id).collect(),
+            RowKey::Workflow(_, w) | RowKey::NoRuns(_, w) => match data.latest_run(w) {
+                Some(run) => vec![run.id],
+                None => return Some("no runs yet (s starts one)".to_string()),
+            },
+            _ => return None,
+        };
+        if runs.is_empty() {
+            return None;
+        }
+        self.detail = Some(RunDetail {
+            repo: key.repo(),
+            jobs: runs.iter().map(|_| Load::Loading).collect(),
+            runs,
+            selected: None,
+            scroll: (0, 0),
+            boxes: Vec::new(),
+            refreshing: 0,
+            next_poll: None,
+        });
+        self.load_jobs();
+        None
+    }
+
+    /// Once every job refresh is back: refresh again soon while any run
+    /// on the detail screen or any of its jobs is active.
+    fn schedule_jobs_poll(&mut self) {
+        let Some(d) = &self.detail else {
+            return;
+        };
+        if d.refreshing > 0 {
+            return;
+        }
+        let active = d.runs.iter().any(|&r| self.run_active(d.repo, r))
+            || d.jobs
+                .iter()
+                .any(|j| matches!(j, Load::Ready(j) if j.iter().any(Job::is_active)));
+        if let Some(d) = self.detail.as_mut() {
+            d.next_poll = active.then(|| Instant::now() + JOBS_POLL);
+        }
+    }
+
+    /// Fetch the jobs of every run on the detail screen.
+    fn load_jobs(&mut self) {
+        let Some(detail) = self.detail.as_mut() else {
+            return;
+        };
+        let Some(data) = self.repos.get(detail.repo).and_then(RepoNode::ready) else {
+            return;
+        };
+        detail.next_poll = None;
+        detail.refreshing = detail.runs.len();
+        for &run in &detail.runs {
+            let account = data.account.clone();
+            let full_name = data.full_name.clone();
+            let tx = self.tx.clone();
+            let idx = detail.repo;
+            std::thread::spawn(move || {
+                let result = gh::run_jobs(&account, &full_name, run).map_err(|e| e.to_string());
+                let _ = tx.send(ActionsEvent::Jobs { idx, run, result });
+            });
+        }
+    }
+
+    /// Keys of the run detail screen; `None` passes the key on to the
+    /// tree's handler (run actions, quit).
+    fn detail_key(&mut self, code: KeyCode) -> Option<KeyOutcome> {
+        let detail = self.detail.as_mut()?;
+        let page = (self.view_area.height as isize / 3).max(1);
+        let status = match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                detail.move_selection(1, 0);
+                None
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                detail.move_selection(-1, 0);
+                None
+            }
+            KeyCode::PageDown => {
+                detail.move_selection(page, 0);
+                None
+            }
+            KeyCode::PageUp => {
+                detail.move_selection(-page, 0);
+                None
+            }
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => {
+                detail.move_selection(0, 1);
+                None
+            }
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => {
+                detail.move_selection(0, -1);
+                None
+            }
+            KeyCode::Enter | KeyCode::Char('o') => self.open_job(),
+            KeyCode::Char('r') => {
+                self.load_jobs();
+                Some("refreshing jobs…".to_string())
+            }
+            KeyCode::Esc => {
+                self.detail = None;
+                None
+            }
+            KeyCode::Char('?') => {
+                self.show_help = true;
+                None
+            }
+            KeyCode::Char('R' | 'F' | 'X' | 'q') => return None,
+            _ => None,
+        };
+        Some(KeyOutcome::Done(status))
+    }
+
+    /// Open the selected job (else its run) in the browser.
+    fn open_job(&self) -> Option<String> {
+        let detail = self.detail.as_ref()?;
+        let data = self.repo_data(detail.repo)?;
+        let (s, job) = detail.selected?;
+        let run = *detail.runs.get(s)?;
+        Some(
+            match gh::open_job_page(&data.account, &data.full_name, run, job) {
+                Ok(()) => "opened job in browser".to_string(),
+                Err(e) => format!("error: {e}"),
+            },
+        )
+    }
+
     /// The run a run action applies to: the selected run, or the latest
     /// run of the selected workflow.
     fn target_run(&self) -> Option<(usize, &WorkflowRun)> {
+        if let Some(d) = &self.detail {
+            // The run of the selected job, else the first run shown.
+            let s = d.selected.map_or(0, |(s, _)| s);
+            let id = *d.runs.get(s)?;
+            let run = self.repo_data(d.repo)?.runs.iter().find(|r| r.id == id)?;
+            return Some((d.repo, run));
+        }
         let (repo, run) = match self.selected? {
             RowKey::Run(r, _, run) => (r, Some(run)),
             RowKey::Workflow(r, _) | RowKey::NoRuns(r, _) => (r, None),
@@ -1458,6 +1748,9 @@ impl ActionsView {
             return KeyOutcome::Done(None);
         }
 
+        if let Some(outcome) = self.detail_key(code) {
+            return outcome;
+        }
         let page = (self.view_area.height as isize).max(1);
         let mut status = None;
         match code {
@@ -1508,11 +1801,11 @@ impl ActionsView {
                 Some(RowKey::Repo(_)) => {
                     self.set_expanded(None);
                 }
-                Some(RowKey::Workflow(r, w)) => status = self.open_modal(r, w),
-                Some(RowKey::Run(..)) => status = self.open_in_browser(),
-                _ => {}
+                _ => status = self.open_detail(),
             },
-            KeyCode::Char('R' | 'F' | 'X') if !self.group_keys().is_empty() => {
+            KeyCode::Char('R' | 'F' | 'X')
+                if self.detail.is_none() && !self.group_keys().is_empty() =>
+            {
                 let action = match code {
                     KeyCode::Char('R') => RunAction::Rerun,
                     KeyCode::Char('F') => RunAction::RerunFailed,
@@ -1560,6 +1853,20 @@ impl ActionsView {
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.modal.is_some() || self.batch_modal.is_some() || self.show_help {
+            return;
+        }
+        if let Some(detail) = self.detail.as_mut() {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => detail.move_selection(1, 0),
+                MouseEventKind::ScrollUp => detail.move_selection(-1, 0),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let at = Position::new(mouse.column, mouse.row);
+                    if let Some((_, target)) = detail.boxes.iter().find(|(r, _)| r.contains(at)) {
+                        detail.selected = Some(*target);
+                    }
+                }
+                _ => {}
+            }
             return;
         }
         match mouse.kind {
@@ -1856,6 +2163,7 @@ mod tests {
             show_help: false,
             modal: None,
             batch_modal: None,
+            detail: None,
             marked: HashSet::new(),
             armed: None,
             batches: Vec::new(),

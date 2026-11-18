@@ -1261,7 +1261,7 @@ fn format_age(secs: i64) -> String {
 }
 
 /// Unix seconds of `YYYY-MM-DDTHH:MM:SSZ`.
-fn parse_utc(ts: &str) -> Option<i64> {
+pub fn parse_utc(ts: &str) -> Option<i64> {
     let num = |range: std::ops::Range<usize>| -> Option<i64> { ts.get(range)?.parse().ok() };
     let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);

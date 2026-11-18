@@ -904,6 +904,108 @@ pub fn workflow_runs(account: &Account, repo: &str) -> Result<Vec<WorkflowRun>> 
         .collect())
 }
 
+/// One step of a job.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Step {
+    pub number: u64,
+    pub name: String,
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+/// One job of a workflow run.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Job {
+    pub id: u64,
+    pub name: String,
+    /// `queued`, `in_progress`, `completed`, `waiting`, `pending`, …
+    pub status: String,
+    pub conclusion: Option<String>,
+    /// When the job was queued: when every job it needs had finished.
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub run_attempt: u64,
+    pub runner_name: Option<String>,
+    pub labels: Vec<String>,
+    pub steps: Vec<Step>,
+}
+
+impl Job {
+    pub fn is_active(&self) -> bool {
+        self.status != "completed"
+    }
+}
+
+/// Every job of the latest attempt of run `run`, as GitHub lists them.
+pub fn run_jobs(account: &Account, repo: &str, run: u64) -> Result<Vec<Job>> {
+    ensure_repo(repo)?;
+    #[derive(Deserialize)]
+    struct Page {
+        #[serde(default)]
+        jobs: Vec<Job>,
+    }
+    let pages: Vec<Page> = serde_json::from_slice(&account.api(&[
+        "--paginate",
+        "--slurp",
+        &format!("repos/{repo}/actions/runs/{run}/jobs?per_page=100"),
+    ])?)
+    .context("unexpected job list response from GitHub")?;
+    let clean = |o: &mut Option<String>| *o = o.as_deref().map(sanitize_line);
+    Ok(pages
+        .into_iter()
+        .flat_map(|p| p.jobs)
+        .map(|mut j| {
+            for field in [&mut j.name, &mut j.status, &mut j.created_at] {
+                *field = sanitize_line(field);
+            }
+            for field in [
+                &mut j.conclusion,
+                &mut j.started_at,
+                &mut j.completed_at,
+                &mut j.runner_name,
+            ] {
+                clean(field);
+            }
+            j.labels = j.labels.iter().map(|l| sanitize_line(l)).collect();
+            for step in &mut j.steps {
+                step.name = sanitize_line(&step.name);
+                step.status = sanitize_line(&step.status);
+                for field in [
+                    &mut step.conclusion,
+                    &mut step.started_at,
+                    &mut step.completed_at,
+                ] {
+                    clean(field);
+                }
+            }
+            j
+        })
+        .collect())
+}
+
+/// Open one job of a run in the browser.
+pub fn open_job_page(account: &Account, repo: &str, run: u64, job: u64) -> Result<()> {
+    ensure_repo(repo)?;
+    let target = format!("{}/{repo}", account.host);
+    let status = account
+        .gh()
+        .args(["run", "view", &run.to_string(), "--job", &job.to_string()])
+        .args(["--repo", &target, "--web"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to run gh — is the GitHub CLI installed?")?;
+    if !status.success() {
+        bail!("gh could not open the page");
+    }
+    Ok(())
+}
+
 /// Contents of a workflow file on the default branch, for workflows the
 /// local checkout doesn't have.
 pub fn workflow_file(account: &Account, repo: &str, path: &str) -> Result<String> {

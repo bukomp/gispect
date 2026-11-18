@@ -12,6 +12,8 @@ mod par;
 mod pr;
 mod pr_cache;
 mod pr_ui;
+mod run_detail_ui;
+mod run_graph;
 mod search;
 mod search_ui;
 mod splash;

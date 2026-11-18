@@ -337,7 +337,7 @@ the list when it finishes. Press `a` again to show all workflows.
 | `h` / `←` | collapse, or go to the parent row |
 | `e` | expand / collapse all (repositories, or every workflow's runs in a single repository) |
 | `a` | show only running runs / show all workflows |
-| `Enter` | run the workflow (form), expand a repository, or open a run in the browser |
+| `Enter` | run details (job graph and steps) of a run, a commit row (all its runs) or a workflow (its latest run); on a repository row: expand / collapse |
 | `s` | start the marked workflows (else the form for the selected workflow) |
 | `R` | re-run the selected run (on a workflow row: its latest run); with marks, all marked |
 | `F` | re-run failed jobs; with marks, all marked |
@@ -350,6 +350,33 @@ the list when it finishes. Press `a` again to show all workflows.
 | `q` | quit |
 
 Mouse: wheel moves the selection, click selects.
+
+### Run details
+
+`Enter` on a run opens its details. On a commit row (running view) it shows
+every run that commit started, and on a workflow row the latest run. Each run
+gets a header line (status, workflow, number, title, event, branch, commit,
+actor, run time). Below the header is a job graph like the one on the run's
+GitHub page: one box per job with status and run time, in columns, with lines
+to the jobs it waited for. The steps of the selected job, with their run
+times, are listed at the bottom. Jobs refresh every 5 seconds while a run is
+active.
+
+The REST API does not say which jobs a job `needs`, so the graph is built
+from timing: GitHub queues a job only after every job it needs has finished.
+A job that is not queued yet (still waiting on its `needs`) only shows up
+once it is queued.
+
+| Key | Action |
+|---|---|
+| `j` / `k`, `↓` / `↑` | job above / below (on into the next or previous run) |
+| `h` / `l`, `←` / `→` | previous / next column |
+| `Enter` / `o` | open the selected job in the browser |
+| `R` / `F` / `X` | re-run / re-run failed jobs / cancel (press twice) the selected job's run |
+| `r` | refresh jobs |
+| `Esc` | back to the tree |
+
+Mouse: wheel moves the selection, click selects a job.
 
 ### Group actions
 

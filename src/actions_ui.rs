@@ -32,7 +32,7 @@ const KEYS: &[KeyGroup] = &[
     (
         "Run",
         &[
-            ("Enter", "run workflow / open run"),
+            ("Enter", "details: job graph and steps"),
             ("s", "start"),
             ("R", "re-run"),
             ("F", "re-run failed jobs"),
@@ -67,6 +67,14 @@ pub fn draw_actions(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     draw_status(f, view, chunks[0]);
+    if view.detail.is_some() {
+        crate::run_detail_ui::draw_detail(f, view, chunks[1]);
+        crate::run_detail_ui::draw_footer(f, status, chunks[2]);
+        if view.show_help {
+            draw_key_help(f, area, crate::run_detail_ui::KEYS, None);
+        }
+        return;
+    }
     draw_tree(f, view, chunks[1]);
     draw_footer(f, view, status, chunks[2]);
     if let Some(modal) = &view.modal {
@@ -194,12 +202,17 @@ fn draw_tree(f: &mut Frame, view: &mut ActionsView, area: Rect) {
 
 /// Status glyph and color of a run.
 pub fn run_glyph(run: &WorkflowRun) -> (&'static str, Color) {
-    match run.status.as_str() {
+    status_glyph(&run.status, run.conclusion.as_deref())
+}
+
+/// Status glyph and color of a run, job or step.
+pub fn status_glyph(status: &str, conclusion: Option<&str>) -> (&'static str, Color) {
+    match status {
         "completed" => {}
         "in_progress" => return ("●", Color::Yellow),
         _ => return ("◌", Color::Yellow),
     }
-    match run.conclusion.as_deref() {
+    match conclusion {
         Some("success") => ("✓", Color::Green),
         Some("failure" | "timed_out" | "startup_failure") => ("✗", Color::Red),
         Some("cancelled" | "skipped") => ("⊘", Color::DarkGray),
@@ -558,7 +571,7 @@ fn draw_footer(f: &mut Frame, view: &ActionsView, status: Option<String>, area: 
         ])
     } else {
         Line::from(Span::styled(
-            " Enter run/open  Space mark  a running only  / filter  ? keys  Esc back",
+            " Enter details  s start  Space mark  a running only  / filter  ? keys  Esc back",
             DIM,
         ))
     };
