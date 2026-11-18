@@ -89,6 +89,34 @@ impl RepoData {
     fn workflow(&self, id: u64) -> Option<&WorkflowNode> {
         self.workflows.iter().find(|w| w.workflow.id == id)
     }
+
+    /// Name of a workflow, or empty if it isn't listed.
+    pub fn workflow_name(&self, id: u64) -> &str {
+        self.workflow(id).map_or("", |w| w.workflow.name.as_str())
+    }
+
+    /// Active runs started by one trigger (see
+    /// [`WorkflowRun::trigger_key`]), ordered by workflow name.
+    pub fn trigger_runs(&self, trigger: u64) -> Vec<&WorkflowRun> {
+        let mut runs: Vec<&WorkflowRun> = self
+            .runs
+            .iter()
+            .filter(|r| r.is_active() && r.trigger_key() == trigger)
+            .collect();
+        runs.sort_by_cached_key(|r| (self.workflow_name(r.workflow_id).to_lowercase(), r.id));
+        runs
+    }
+
+    /// Keys of the triggers with active runs, newest first.
+    pub fn active_triggers(&self) -> Vec<u64> {
+        let mut seen = HashSet::new();
+        let mut runs: Vec<&WorkflowRun> = self.runs.iter().filter(|r| r.is_active()).collect();
+        runs.sort_by_key(|r| std::cmp::Reverse(r.id));
+        runs.into_iter()
+            .map(WorkflowRun::trigger_key)
+            .filter(|k| seen.insert(*k))
+            .collect()
+    }
 }
 
 /// One local repository in the tree.
@@ -171,6 +199,9 @@ pub enum RowKey {
     /// Repository status line (loading, error, no workflows).
     Note(usize),
     Workflow(usize, u64),
+    /// One push or pull request update and the runs it started; only
+    /// while showing running runs. Keyed by [`WorkflowRun::trigger_key`].
+    Trigger(usize, u64),
     Run(usize, u64, u64),
     /// "no recent runs" under an expanded workflow.
     NoRuns(usize, u64),
@@ -182,20 +213,26 @@ impl RowKey {
             RowKey::Repo(r)
             | RowKey::Note(r)
             | RowKey::Workflow(r, _)
+            | RowKey::Trigger(r, _)
             | RowKey::Run(r, _, _)
             | RowKey::NoRuns(r, _) => r,
         }
     }
 
-    /// Workflow and run rows can be marked for group actions.
+    /// Workflow, trigger and run rows can be marked for group actions.
     fn markable(self) -> bool {
-        matches!(self, RowKey::Workflow(..) | RowKey::Run(..))
+        matches!(
+            self,
+            RowKey::Workflow(..) | RowKey::Trigger(..) | RowKey::Run(..)
+        )
     }
 
     fn parent(self) -> Option<RowKey> {
         match self {
             RowKey::Repo(_) => None,
-            RowKey::Note(r) | RowKey::Workflow(r, _) => Some(RowKey::Repo(r)),
+            RowKey::Note(r) | RowKey::Workflow(r, _) | RowKey::Trigger(r, _) => {
+                Some(RowKey::Repo(r))
+            }
             RowKey::Run(r, w, _) | RowKey::NoRuns(r, w) => Some(RowKey::Workflow(r, w)),
         }
     }
@@ -735,6 +772,7 @@ impl ActionsView {
             match *key {
                 RowKey::Workflow(_, w) => data.workflow(w).is_some(),
                 RowKey::Run(_, _, run) => data.runs.iter().any(|r| r.id == run),
+                RowKey::Trigger(_, t) => !data.trigger_runs(t).is_empty(),
                 _ => false,
             }
         });
@@ -793,26 +831,56 @@ impl ActionsView {
         for (i, repo) in self.repos.iter().enumerate() {
             let full_name = repo.remote.as_ref().map_or("", |(_, n)| n.as_str());
             let repo_hit = hit(&repo.name) || hit(full_name);
-            let workflows: Vec<&WorkflowNode> = repo
-                .ready()
-                .map(|d| {
-                    d.workflows
-                        .iter()
-                        .filter(|w| repo_hit || hit(&w.workflow.name) || hit(&w.workflow.path))
-                        .filter(|w| {
-                            !running || d.runs_of(w.workflow.id).any(WorkflowRun::is_active)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let workflow_hit =
+                |w: &WorkflowNode| repo_hit || hit(&w.workflow.name) || hit(&w.workflow.path);
             if running {
+                // Active runs grouped by the push or pull request that
+                // started them, so one commit shows once, with a row per
+                // workflow it started.
+                let groups: Vec<(u64, Vec<&WorkflowRun>)> = repo
+                    .ready()
+                    .map(|d| {
+                        d.active_triggers()
+                            .into_iter()
+                            .map(|t| {
+                                let runs = d
+                                    .trigger_runs(t)
+                                    .into_iter()
+                                    .filter(|r| {
+                                        hit(&r.display_title)
+                                            || d.workflow(r.workflow_id).is_some_and(workflow_hit)
+                                    })
+                                    .collect();
+                                (t, runs)
+                            })
+                            .filter(|(_, runs): &(u64, Vec<&WorkflowRun>)| !runs.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 // Only repositories with running runs, and those that
                 // failed to load (they may have some).
                 let failed = matches!(repo.data, Load::Failed(_));
-                if workflows.is_empty() && !(failed && repo_hit) {
+                if groups.is_empty() && !(failed && repo_hit) {
                     continue;
                 }
-            } else if !repo_hit && workflows.is_empty() {
+                if self.multi {
+                    out.push(RowKey::Repo(i));
+                }
+                if repo.note().is_some() {
+                    out.push(RowKey::Note(i));
+                    continue;
+                }
+                for (t, runs) in groups {
+                    out.push(RowKey::Trigger(i, t));
+                    out.extend(runs.iter().map(|r| RowKey::Run(i, r.workflow_id, r.id)));
+                }
+                continue;
+            }
+            let workflows: Vec<&WorkflowNode> = repo
+                .ready()
+                .map(|d| d.workflows.iter().filter(|w| workflow_hit(w)).collect())
+                .unwrap_or_default();
+            if !repo_hit && workflows.is_empty() {
                 continue;
             }
             if self.multi {
@@ -831,13 +899,7 @@ impl ActionsView {
             for w in workflows {
                 let id = w.workflow.id;
                 out.push(RowKey::Workflow(i, id));
-                if running {
-                    out.extend(
-                        data.runs_of(id)
-                            .filter(|r| r.is_active())
-                            .map(|r| RowKey::Run(i, id, r.id)),
-                    );
-                } else if repo.open_workflows.contains(&id) {
+                if repo.open_workflows.contains(&id) {
                     let before = out.len();
                     out.extend(
                         data.runs_of(id)
@@ -888,9 +950,22 @@ impl ActionsView {
                 self.selected = Some(k);
                 return;
             }
-            key = k.parent();
+            key = self.parent_of(k);
         }
         self.selected = rows.first().copied();
+    }
+
+    /// The row a row sits under: while showing running runs, a run sits
+    /// under its trigger rather than its workflow.
+    fn parent_of(&self, key: RowKey) -> Option<RowKey> {
+        match key {
+            RowKey::Run(r, _, id) if self.running_only => self
+                .repo_data(r)
+                .and_then(|d| d.runs.iter().find(|run| run.id == id))
+                .map(|run| RowKey::Trigger(r, run.trigger_key()))
+                .or(Some(RowKey::Repo(r))),
+            _ => key.parent(),
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -1206,7 +1281,7 @@ impl ActionsView {
     /// and for each marked workflow its latest run (every active run, to
     /// cancel). Also how many marked rows it doesn't apply to.
     fn group_targets(&self, action: RunAction) -> (Vec<RunTarget>, usize) {
-        let mut keys: Vec<RowKey> = self.marked.iter().copied().collect();
+        let mut keys = self.group_keys();
         keys.sort_unstable();
         let mut seen = BTreeSet::new();
         let mut targets = Vec::new();
@@ -1222,6 +1297,7 @@ impl ActionsView {
                     data.runs_of(w).filter(|r| r.is_active()).collect()
                 }
                 RowKey::Workflow(_, w) => data.latest_run(w).into_iter().collect(),
+                RowKey::Trigger(_, t) => data.trigger_runs(t),
                 _ => continue,
             };
             let mut applies = false;
@@ -1243,7 +1319,20 @@ impl ActionsView {
         (targets, skipped)
     }
 
-    /// `R`, `F` or `X` with rows marked: the first press says what it
+    /// Rows a group action covers: the marked rows, else a selected
+    /// trigger row (all the runs it started).
+    fn group_keys(&self) -> Vec<RowKey> {
+        if self.marked.is_empty() {
+            self.selected
+                .filter(|k| matches!(k, RowKey::Trigger(..)))
+                .into_iter()
+                .collect()
+        } else {
+            self.marked.iter().copied().collect()
+        }
+    }
+
+    /// `R`, `F` or `X` with rows marked (or a trigger selected): the first press says what it
     /// will do, the second does it to every marked run it applies to.
     fn group_run_action(
         &mut self,
@@ -1252,7 +1341,7 @@ impl ActionsView {
     ) -> String {
         let (targets, skipped) = self.group_targets(action);
         if targets.is_empty() {
-            return format!("{} applies to none of the marked rows", action.label());
+            return format!("{} applies to none of the selected runs", action.label());
         }
         let ids: Vec<u64> = targets.iter().map(|t| t.run_id).collect();
         if armed.as_ref() != Some(&(action, ids.clone())) {
@@ -1306,6 +1395,10 @@ impl ActionsView {
         let (repo, workflow, run) = match self.selected? {
             RowKey::Workflow(r, w) | RowKey::NoRuns(r, w) => (r, w, None),
             RowKey::Run(r, w, run) => (r, w, Some(run)),
+            RowKey::Trigger(r, t) => {
+                let run = *self.repo_data(r)?.trigger_runs(t).first()?;
+                (r, run.workflow_id, Some(run.id))
+            }
             _ => return Some("select a workflow or run".to_string()),
         };
         let data = self.repo_data(repo)?;
@@ -1402,7 +1495,7 @@ impl ActionsView {
             KeyCode::Char('h') | KeyCode::Left => {
                 if !self.set_expanded(Some(false)) {
                     // Already collapsed: go up a level instead.
-                    let parent = self.selected.and_then(RowKey::parent);
+                    let parent = self.selected.and_then(|k| self.parent_of(k));
                     if parent.is_some_and(|p| self.rows().contains(&p)) {
                         self.selected = parent;
                     }
@@ -1419,7 +1512,7 @@ impl ActionsView {
                 Some(RowKey::Run(..)) => status = self.open_in_browser(),
                 _ => {}
             },
-            KeyCode::Char('R' | 'F' | 'X') if !self.marked.is_empty() => {
+            KeyCode::Char('R' | 'F' | 'X') if !self.group_keys().is_empty() => {
                 let action = match code {
                     KeyCode::Char('R') => RunAction::Rerun,
                     KeyCode::Char('F') => RunAction::RerunFailed,
@@ -1996,11 +2089,13 @@ mod tests {
         set_status(&mut v, 0, 10, "queued");
         v.handle_key(KeyCode::Char('a'), KeyModifiers::NONE);
         assert!(v.running_only);
+        // Both runs have the same (empty) commit: one trigger.
+        let t = WorkflowRun::default().trigger_key();
         assert_eq!(
             v.rows(),
             vec![
                 RowKey::Repo(0),
-                RowKey::Workflow(0, 1),
+                RowKey::Trigger(0, t),
                 RowKey::Run(0, 1, 10),
                 RowKey::Run(0, 1, 11),
                 RowKey::Repo(2),
@@ -2008,7 +2103,9 @@ mod tests {
             ]
         );
         // Folding does nothing; Left goes up a level.
-        v.selected = Some(RowKey::Workflow(0, 1));
+        v.selected = Some(RowKey::Run(0, 1, 11));
+        v.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(v.selected, Some(RowKey::Trigger(0, t)));
         v.handle_key(KeyCode::Left, KeyModifiers::NONE);
         assert_eq!(v.selected, Some(RowKey::Repo(0)));
         assert!(v.rows().contains(&RowKey::Run(0, 1, 11)));
@@ -2033,9 +2130,56 @@ mod tests {
         v.repos[0].open_workflows.insert(1);
         set_status(&mut v, 0, 11, "waiting");
         v.running_only = true;
+        let t = WorkflowRun::default().trigger_key();
+        assert_eq!(v.rows(), vec![RowKey::Trigger(0, t), RowKey::Run(0, 1, 11)]);
+    }
+
+    #[test]
+    fn running_only_groups_runs_by_trigger() {
+        let mut v = view(
+            false,
+            vec![(
+                "r",
+                Load::Ready(data(&[1, 2, 3], &[(13, 3), (12, 1), (11, 2), (10, 1)])),
+            )],
+        );
+        // One push starts workflows 1 and 2 (runs 10, 11); a later push
+        // starts 1 and 3 (12, 13).
+        if let Load::Ready(d) = &mut v.repos[0].data {
+            for r in d.runs.iter_mut() {
+                r.status = "in_progress".into();
+                r.event = "push".into();
+                r.head_sha = if r.id < 12 { "aaa" } else { "bbb" }.into();
+            }
+        }
+        v.running_only = true;
+        let d = v.repos[0].ready().unwrap();
+        let (old, new) = (d.runs[3].trigger_key(), d.runs[0].trigger_key());
+        assert_ne!(old, new);
         assert_eq!(
             v.rows(),
-            vec![RowKey::Workflow(0, 1), RowKey::Run(0, 1, 11)]
+            vec![
+                RowKey::Trigger(0, new),
+                RowKey::Run(0, 1, 12),
+                RowKey::Run(0, 3, 13),
+                RowKey::Trigger(0, old),
+                RowKey::Run(0, 1, 10),
+                RowKey::Run(0, 2, 11),
+            ],
+            "newest trigger first, its runs by workflow name"
+        );
+        // X on a trigger cancels every run it started, after a confirm.
+        v.selected = Some(RowKey::Trigger(0, old));
+        let KeyOutcome::Done(Some(msg)) = v.handle_key(KeyCode::Char('X'), KeyModifiers::NONE)
+        else {
+            panic!("expected a status");
+        };
+        assert_eq!(msg, "press X again: cancel of 2 run(s)");
+        // The filter matches workflow names within a trigger.
+        v.text_filter = Some("wf3".into());
+        assert_eq!(
+            v.rows(),
+            vec![RowKey::Trigger(0, new), RowKey::Run(0, 3, 13)]
         );
     }
 

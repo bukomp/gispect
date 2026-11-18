@@ -80,7 +80,7 @@ pub fn draw_actions(f: &mut Frame, app: &mut App, area: Rect) {
             f,
             area,
             KEYS,
-            Some("With marks, s R F X act on all marked."),
+            Some("With marks, s R F X act on all marked; on a commit row (a), on its runs."),
         );
     }
 }
@@ -299,9 +299,16 @@ fn row_line(view: &ActionsView, key: RowKey, width: usize) -> Line<'static> {
                 None => Vec::new(),
             }
         }
+        RowKey::Trigger(_, trigger) => match data {
+            Some(d) => return trigger_line(d, trigger, indent, width),
+            None => Vec::new(),
+        },
         RowKey::Run(_, _, run_id) => {
-            match data.and_then(|d| d.runs.iter().find(|r| r.id == run_id)) {
-                Some(run) => return run_line(run, indent, width),
+            match data.and_then(|d| Some((d, d.runs.iter().find(|r| r.id == run_id)?))) {
+                Some((d, run)) if view.running_only => {
+                    return trigger_run_line(d, run, indent, width)
+                }
+                Some((_, run)) => return run_line(run, indent, width),
                 None => Vec::new(),
             }
         }
@@ -407,6 +414,99 @@ fn run_line(run: &WorkflowRun, indent: &str, width: usize) -> Line<'static> {
     let pad = width.saturating_sub(used + Span::raw(title.as_str()).width());
     let mut spans = left;
     spans.push(Span::raw(title));
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(right);
+    Line::from(spans)
+}
+
+/// A trigger row (running runs only): what started the runs below it —
+/// the commit or PR title, then right-aligned event, branch, commit and
+/// age.
+fn trigger_line(data: &RepoData, trigger: u64, indent: &str, width: usize) -> Line<'static> {
+    let runs = data.trigger_runs(trigger);
+    let Some(first) = runs.first() else {
+        return Line::default();
+    };
+    // Running if any run is, else queued / waiting.
+    let (glyph, color) = runs
+        .iter()
+        .map(|r| run_glyph(r))
+        .find(|(g, _)| *g == "●")
+        .unwrap_or_else(|| run_glyph(first));
+    let left = vec![
+        Span::raw(indent.to_string()),
+        Span::styled(glyph, Style::default().fg(color)),
+        Span::raw(" "),
+    ];
+    let oldest = runs
+        .iter()
+        .map(|r| r.created_at.as_str())
+        .min()
+        .unwrap_or("");
+    let mut detail = first.event.clone();
+    if let Some(branch) = &first.head_branch {
+        detail.push_str(&format!(" · {branch}"));
+    }
+    if !first.head_sha.is_empty() {
+        detail.push_str(&format!(" · {}", first.short_sha()));
+    }
+    detail.push_str(&format!(
+        " · {} run{} · {:>4} ",
+        runs.len(),
+        if runs.len() == 1 { "" } else { "s" },
+        pr::age(oldest)
+    ));
+    let right = Span::styled(format!("  {detail}"), DIM);
+    let title = Span::styled(
+        first.display_title.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    );
+    fill_line(left, title, right, width)
+}
+
+/// A run row under a trigger: glyph, workflow name and run number, then
+/// right-aligned actor and age (the title is on the trigger row).
+fn trigger_run_line(
+    data: &RepoData,
+    run: &WorkflowRun,
+    indent: &str,
+    width: usize,
+) -> Line<'static> {
+    let (glyph, color) = run_glyph(run);
+    let left = vec![
+        Span::raw(format!("{indent}    ")),
+        Span::styled(glyph, Style::default().fg(color)),
+        Span::raw(" "),
+    ];
+    let mut name = data.workflow_name(run.workflow_id).to_string();
+    if name.is_empty() {
+        name = format!("workflow {}", run.workflow_id);
+    }
+    let status = run.status.replace('_', " ");
+    let right = Span::styled(
+        format!(
+            "  {status} · #{} · @{} · {:>4} ",
+            run.run_number,
+            run.actor,
+            pr::age(&run.created_at)
+        ),
+        DIM,
+    );
+    fill_line(left, Span::raw(name), right, width)
+}
+
+/// `left`, then `middle` cut to fit, then `right` flush with `width`.
+fn fill_line(
+    left: Vec<Span<'static>>,
+    middle: Span<'static>,
+    right: Span<'static>,
+    width: usize,
+) -> Line<'static> {
+    let used: usize = left.iter().map(Span::width).sum::<usize>() + right.width();
+    let text = truncate(&middle.content, width.saturating_sub(used));
+    let pad = width.saturating_sub(used + Span::raw(text.as_str()).width());
+    let mut spans = left;
+    spans.push(Span::styled(text, middle.style));
     spans.push(Span::raw(" ".repeat(pad)));
     spans.push(right);
     Line::from(spans)

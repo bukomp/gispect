@@ -841,6 +841,8 @@ pub struct WorkflowRun {
     /// Set once completed: `success`, `failure`, `cancelled`, …
     pub conclusion: Option<String>,
     pub head_branch: Option<String>,
+    /// Commit the run is for.
+    pub head_sha: String,
     pub event: String,
     /// ISO-8601 UTC timestamp.
     pub created_at: String,
@@ -851,6 +853,21 @@ pub struct WorkflowRun {
 impl WorkflowRun {
     pub fn is_active(&self) -> bool {
         self.status != "completed"
+    }
+
+    /// Identifies what started the run: one push or pull request update
+    /// (same commit, event and branch) starts a run of every workflow it
+    /// triggers.
+    pub fn trigger_key(&self) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        (&self.head_sha, &self.event, &self.head_branch).hash(&mut h);
+        h.finish()
+    }
+
+    /// Short commit hash.
+    pub fn short_sha(&self) -> &str {
+        self.head_sha.get(..7).unwrap_or(&self.head_sha)
     }
 }
 
@@ -872,6 +889,7 @@ pub fn workflow_runs(account: &Account, repo: &str) -> Result<Vec<WorkflowRun>> 
         .map(|mut r| {
             for field in [
                 &mut r.display_title,
+                &mut r.head_sha,
                 &mut r.status,
                 &mut r.event,
                 &mut r.created_at,

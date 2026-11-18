@@ -315,9 +315,13 @@ dimmed. Expanding a workflow lists its latest 8 runs (from the repository's
 Glyphs: `✓` success, `✗` failure / timed out, `⊘` cancelled / skipped, `●` in
 progress, `◌` queued / waiting, `!` action required, `·` no recent runs.
 
-`a` shows only the runs that are queued or in progress, under their workflows,
-across all repositories. Everything is expanded, and repositories and
-workflows with no active runs are hidden. Repositories that failed to load
+`a` shows only the runs that are queued or in progress, across all
+repositories, grouped by what started them. One push or pull request update
+usually starts several workflows, so each commit gets one row (title, event,
+branch, short commit hash, run count, age) with one row per workflow run under
+it (workflow name, status, run number, actor, age). Newest commits are on top.
+`R`, `F` and `X` on a commit row act on all of its runs. Repositories with no
+active runs are hidden. Repositories that failed to load
 stay visible. Runs refresh every 8 seconds while one is active and every 20
 seconds while none is, so runs started elsewhere also show up. A run leaves
 the list when it finishes. Press `a` again to show all workflows.
@@ -327,7 +331,7 @@ the list when it finishes. Press `a` again to show all workflows.
 | `j` / `k`, `↓` / `↑` | select |
 | `g` / `G` | top / bottom |
 | `PgDn` / `PgUp` | page |
-| `Space` | mark / unmark a workflow or run and move down (on a repository row: expand / collapse) |
+| `Space` | mark / unmark a workflow, commit or run and move down (on a repository row: expand / collapse) |
 | `u` | unmark all |
 | `l` / `→` | expand |
 | `h` / `←` | collapse, or go to the parent row |
@@ -337,7 +341,7 @@ the list when it finishes. Press `a` again to show all workflows.
 | `s` | start the marked workflows (else the form for the selected workflow) |
 | `R` | re-run the selected run (on a workflow row: its latest run); with marks, all marked |
 | `F` | re-run failed jobs; with marks, all marked |
-| `X` | cancel an active run (press twice to confirm); with marks, all marked |
+| `X` | cancel an active run (press twice to confirm); on a commit row, all its runs; with marks, all marked |
 | `o` | open the workflow or run in the browser |
 | `/` | filter repositories and workflows by name or path (smart-case, live; `Enter` keeps, `Esc` clears) |
 | `r` | refresh everything |
