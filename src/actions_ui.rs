@@ -258,6 +258,16 @@ fn row_line(view: &ActionsView, key: RowKey, width: usize) -> Line<'static> {
                 ));
             }
             spans.push(Span::styled(format!("  {}", repo.branch), DIM));
+            if !repo.checkouts.is_empty() {
+                spans.push(Span::styled(
+                    format!(
+                        "  +{} checkout{}",
+                        repo.checkouts.len(),
+                        if repo.checkouts.len() == 1 { "" } else { "s" }
+                    ),
+                    DIM,
+                ));
+            }
             match (data, repo.note()) {
                 (Some(d), None) => {
                     spans.push(Span::raw("  "));

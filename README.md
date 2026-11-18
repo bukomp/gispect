@@ -55,7 +55,9 @@ used, as before.
   gets the files from GitHub.
 - `gispect mcp` serves the same combined view: paths in tool input and output
   have the repository prefix.
-- The actions view (`a`) shows a tree with one collapsible row per repository.
+- The actions view (`a`) shows a tree with one collapsible row per repository. Several local folders of
+  the same GitHub repository (clones, worktrees) share one row, marked
+  `+N checkouts`.
 
 ## Diff modes
 

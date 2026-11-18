@@ -236,6 +236,9 @@ pub struct RepoNode {
     root: PathBuf,
     /// Branch checked out locally; the default ref to run on.
     pub branch: String,
+    /// Other local folders of the same GitHub repository, shown on this
+    /// one node so their runs aren't listed once per folder.
+    pub checkouts: Vec<String>,
     /// `(host, owner/name)` of the first remote that looks like GitHub.
     pub remote: Option<(String, String)>,
     pub data: Load<RepoData>,
@@ -590,6 +593,7 @@ impl ActionsView {
                 remote,
                 root: repo.root().to_path_buf(),
                 branch: gh::sanitize_line(&branch),
+                checkouts: Vec::new(),
                 data: Load::Loading,
                 expanded: false,
                 open_workflows: HashSet::new(),
@@ -599,6 +603,7 @@ impl ActionsView {
                 watch_until: None,
             })
             .collect();
+        let repos = merge_checkouts(repos);
         let (tx, rx) = mpsc::channel();
         let mut view = ActionsView {
             multi: workspace.is_multi(),
@@ -973,7 +978,8 @@ impl ActionsView {
         let mut out = Vec::new();
         for (i, repo) in self.repos.iter().enumerate() {
             let full_name = repo.remote.as_ref().map_or("", |(_, n)| n.as_str());
-            let repo_hit = hit(&repo.name) || hit(full_name);
+            let repo_hit =
+                hit(&repo.name) || hit(full_name) || repo.checkouts.iter().any(|c| hit(c));
             let workflow_hit =
                 |w: &WorkflowNode| repo_hit || hit(&w.workflow.name) || hit(&w.workflow.path);
             if running {
@@ -1886,6 +1892,39 @@ impl ActionsView {
     }
 }
 
+/// One node per GitHub repository: local folders with the same remote
+/// (clones, worktrees) fold into one, named after the folder that matches
+/// the repository name if any, else the first. Folders without a GitHub
+/// remote stay as they are.
+fn merge_checkouts(nodes: Vec<RepoNode>) -> Vec<RepoNode> {
+    let key = |n: &RepoNode| {
+        n.remote
+            .as_ref()
+            .map(|(host, name)| (host.to_lowercase(), name.to_lowercase()))
+    };
+    let mut out: Vec<RepoNode> = Vec::new();
+    for node in nodes {
+        let Some(k) = key(&node) else {
+            out.push(node);
+            continue;
+        };
+        let Some(i) = out.iter().position(|o| key(o).as_ref() == Some(&k)) else {
+            out.push(node);
+            continue;
+        };
+        let short = k.1.rsplit('/').next().unwrap_or("").to_string();
+        let kept = &mut out[i];
+        if node.name.to_lowercase() == short && kept.name.to_lowercase() != short {
+            let old = std::mem::replace(kept, node);
+            kept.checkouts.push(old.name);
+            kept.checkouts.extend(old.checkouts);
+        } else {
+            kept.checkouts.push(node.name);
+        }
+    }
+    out
+}
+
 /// Everything the tree shows for one repository: pick the account, list
 /// workflows and recent runs, and read each workflow's dispatch inputs.
 fn fetch_repo(
@@ -2146,6 +2185,7 @@ mod tests {
                     name: name.into(),
                     root: PathBuf::new(),
                     branch: "main".into(),
+                    checkouts: Vec::new(),
                     remote: Some(("github.com".into(), format!("o/{name}"))),
                     data,
                     expanded: !multi,
@@ -2440,6 +2480,30 @@ mod tests {
         v.running_only = true;
         let t = WorkflowRun::default().trigger_key();
         assert_eq!(v.rows(), vec![RowKey::Trigger(0, t), RowKey::Run(0, 1, 11)]);
+    }
+
+    #[test]
+    fn checkouts_of_one_repo_merge() {
+        let v = view(
+            true,
+            vec![
+                ("x-perf", Load::Loading),
+                ("x", Load::Loading),
+                ("y", Load::Loading),
+                ("x-base", Load::Loading),
+            ],
+        );
+        let mut nodes = v.repos;
+        for n in &mut nodes {
+            if n.name.starts_with('x') {
+                n.remote = Some(("GitHub.com".into(), "O/X".into()));
+            }
+        }
+        nodes[3].remote = Some(("github.com".into(), "o/x".into()));
+        let merged = merge_checkouts(nodes);
+        let names: Vec<&str> = merged.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, vec!["x", "y"], "named after the matching folder");
+        assert_eq!(merged[0].checkouts, vec!["x-perf", "x-base"]);
     }
 
     #[test]
